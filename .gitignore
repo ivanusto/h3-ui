@@ -1,0 +1,11 @@
+# Secrets. The API key lives here — never commit it.
+.env
+
+# Generated videos and their sidecar metadata.
+media/
+
+# Runtime noise.
+ui.log
+*.log
+__pycache__/
+*.py[cod]
