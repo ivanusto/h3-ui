@@ -293,6 +293,34 @@ def job_list():
     return jobs
 
 
+def forget_job(job_id):
+    """Drop a finished job from the queue list. The video is untouched."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return None
+        if job.get("state") not in FINAL_STATES:
+            return job.get("state")
+        del JOBS[job_id]
+        return "forgotten"
+
+
+def forget_finished_jobs():
+    """Clear every finished entry at once. Returns how many went."""
+    with JOBS_LOCK:
+        gone = [i for i, j in JOBS.items() if j.get("state") in FINAL_STATES]
+        for job_id in gone:
+            del JOBS[job_id]
+    return len(gone)
+
+
+def forget_jobs_for_file(name):
+    """Drop queue entries pointing at a file that no longer exists."""
+    with JOBS_LOCK:
+        for job_id in [i for i, j in JOBS.items() if j.get("file") == name]:
+            del JOBS[job_id]
+
+
 def cancel_job(job_id):
     """Cancel a job that has not started. Returns the resulting state."""
     with JOBS_LOCK:
@@ -469,6 +497,18 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
         if path.startswith("/api/history/"):
             self.delete_media(path[len("/api/history/"):])
+        elif path == "/api/jobs/finished":
+            self._send(200, json.dumps({"forgotten": forget_finished_jobs()}))
+        elif path.startswith("/api/job/"):
+            job_id = path[len("/api/job/"):]
+            state = forget_job(job_id)
+            if state is None:
+                self._send(404, json.dumps({"error": "unknown job"}))
+            elif state == "forgotten":
+                self._send(200, json.dumps({"id": job_id, "state": state}))
+            else:
+                self._send(409, json.dumps(
+                    {"error": f"還在 {state}，無法從清單移除", "state": state}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -499,6 +539,9 @@ class Handler(BaseHTTPRequestHandler):
             except OSError as exc:
                 self._send(500, json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
                 return
+        # Otherwise the queue keeps listing a result whose file is gone, and
+        # clicking it plays nothing.
+        forget_jobs_for_file(name)
         self._send(200, json.dumps({"deleted": removed}))
 
     def do_POST(self):
@@ -619,6 +662,10 @@ INDEX_HTML = r"""<!doctype html>
   .pill.bad { color: var(--danger); border-color: #4a2320; }
   main { display: grid; grid-template-columns: minmax(340px, 430px) 1fr;
     gap: 24px; padding: 24px; align-items: start; }
+  /* Grid items default to min-width:auto, so one long unbroken line — a
+     structured prompt, say — widens the track and scrolls the whole page
+     sideways. Let them shrink and clip instead. */
+  main > section { min-width: 0; }
   @media (max-width: 940px) { main { grid-template-columns: 1fr; } }
   .panel { background: var(--panel); border: 1px solid var(--line);
     border-radius: 12px; padding: 18px; }
@@ -644,7 +691,10 @@ INDEX_HTML = r"""<!doctype html>
   .q { display: flex; align-items: center; gap: 10px; padding: 9px 0;
     border-bottom: 1px solid var(--line); font-size: 13px; }
   .q:last-child { border-bottom: 0; }
-  .q .txt { flex: 1; min-width: 0; overflow: hidden;
+  .q .txt { flex: 1; min-width: 0; }
+  /* text-overflow only ellipsises a single line, so each row clips on its
+     own rather than relying on a <br> inside one clipped box. */
+  .q .line { display: block; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
   .q .sub { font-size: 11px; color: var(--muted);
     font-family: ui-monospace, monospace; }
@@ -983,16 +1033,40 @@ async function loadQueue() {
     else if (j.state === "queued") sub += ` · 第 ${j.position} 順位`;
     else if (j.state === "done") sub += ` · ${fmt(j.elapsed || 0)}`;
     else if (j.state === "failed") sub = esc((j.error || "").split("\n")[0]).slice(0, 120);
-    return `<div class="q${j.state === "done" ? " click" : ""}"${
-        j.state === "done" ? ` onclick="show('${j.file}')"` : ""}>
+    const done = j.state === "done";
+    const final = done || j.state === "failed" || j.state === "cancelled";
+    return `<div class="q${done ? " click" : ""}"${
+        done ? ` onclick="show('${j.file}')"` : ""}>
       <span class="tag ${cls}">${text}</span>
-      <span class="txt">${esc(p.prompt) || "(無 prompt)"}<br>
-        <span class="sub">${sub}</span></span>
+      <span class="txt">
+        <span class="line">${esc(p.description || p.prompt) || "(無 prompt)"}</span>
+        <span class="line sub">${sub}</span></span>
       ${j.state === "queued"
         ? `<button class="x" onclick="event.stopPropagation();cancelJob('${j.id}')">取消</button>`
         : ""}
+      ${final
+        ? `<button class="x" title="從佇列清單移除（不影響影片檔）"
+             onclick="event.stopPropagation();forgetJob('${j.id}')">✕</button>`
+        : ""}
     </div>`;
   }).join("") || '<p class="hint">佇列是空的。</p>';
+  const finished = jobs.filter(j => ["done","failed","cancelled"].includes(j.state));
+  if (finished.length > 1) {
+    $("queue").innerHTML += `<p class="hint" style="margin-top:12px">
+      <a href="#" onclick="forgetFinished();return false">清除全部已完成（${finished.length}）</a></p>`;
+  }
+}
+
+// Forgetting only drops the queue entry. The video stays on disk and in the
+// history, where deleting is a separate, louder action.
+async function forgetJob(id) {
+  await fetch("/api/job/" + id, {method: "DELETE"});
+  loadQueue();
+}
+
+async function forgetFinished() {
+  await fetch("/api/jobs/finished", {method: "DELETE"});
+  loadQueue();
 }
 
 async function cancelJob(id) {
