@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# Copyright 2026 ivanusto
+# SPDX-License-Identifier: Apache-2.0
 """Local frontend for the MiniMax H3 video service.
 
 Serves a browser UI and proxies generation requests to vLLM-Omni so the API key
