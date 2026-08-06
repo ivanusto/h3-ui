@@ -13,6 +13,7 @@ import binascii
 import json
 import mimetypes
 import os
+import queue
 import random
 import re
 import threading
@@ -104,7 +105,17 @@ PARTITION = load_partition()
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
-GPU_LOCK = threading.Lock()
+
+# One worker draining a FIFO queue, rather than a thread per job contending on
+# a lock: threading.Lock has no ordering guarantee, so queued work used to
+# start in an arbitrary order. The GPU serialises the real work regardless —
+# this makes the order you submitted the order you get.
+JOB_QUEUE = queue.Queue()
+
+# Finished jobs stay listed so the queue view keeps its history across a page
+# reload, but not without bound.
+MAX_FINISHED = 60
+FINAL_STATES = ("done", "failed", "cancelled")
 
 
 def auth_headers():
@@ -185,53 +196,125 @@ def build_request(params, attachments):
 
 
 def run_job(job_id, params, attachments):
+    """Run one generation to completion. Called only by the queue worker."""
     def touch(**kw):
         with JOBS_LOCK:
-            JOBS[job_id].update(kw)
+            if job_id in JOBS:
+                JOBS[job_id].update(kw)
 
-    touch(state="queued")
-    with GPU_LOCK:
-        started = time.time()
-        touch(state="running", started=started)
+    started = time.time()
+    touch(state="running", started=started)
+    try:
+        fields, files = build_request(params, attachments)
+    except ValueError as exc:
+        touch(state="failed", error=str(exc), elapsed=0)
+        return
+    body, content_type = encode_multipart(fields, files)
+    request = urllib.request.Request(
+        f"{API_BASE}/v1/videos/sync", data=body,
+        headers={"Content-Type": content_type, **auth_headers()},
+        method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
+            payload = response.read()
+            kind = response.headers.get("Content-Type", "")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:1200]
+        touch(state="failed", error=f"HTTP {exc.code}: {detail}",
+              elapsed=time.time() - started)
+        return
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
+        touch(state="failed", error=f"{type(exc).__name__}: {exc}",
+              elapsed=time.time() - started)
+        return
+
+    elapsed = time.time() - started
+    if "video" not in kind and not payload.startswith(b"\x00\x00\x00"):
+        touch(state="failed", elapsed=elapsed,
+              error=f"non-video response ({kind}): "
+                    f"{payload[:1200].decode('utf-8', 'replace')}")
+        return
+
+    MEDIA.mkdir(exist_ok=True)
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}.mp4"
+    (MEDIA / name).write_bytes(payload)
+    (MEDIA / (name + ".json")).write_text(
+        json.dumps({**params, "elapsed": elapsed, "file": name,
+                    "attached": sorted(k for k, v in attachments.items() if v)},
+                   indent=2, ensure_ascii=False))
+    touch(state="done", elapsed=elapsed, file=name, size=len(payload))
+
+
+def worker_loop():
+    """Drain the queue forever, one job at a time, in submission order."""
+    while True:
+        job_id, params, attachments = JOB_QUEUE.get()
         try:
-            fields, files = build_request(params, attachments)
-        except ValueError as exc:
-            touch(state="failed", error=str(exc), elapsed=0)
-            return
-        body, content_type = encode_multipart(fields, files)
-        request = urllib.request.Request(
-            f"{API_BASE}/v1/videos/sync", data=body,
-            headers={"Content-Type": content_type, **auth_headers()},
-            method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-                payload = response.read()
-                kind = response.headers.get("Content-Type", "")
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", "replace")[:1200]
-            touch(state="failed", error=f"HTTP {exc.code}: {detail}",
-                  elapsed=time.time() - started)
-            return
-        except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
-            touch(state="failed", error=f"{type(exc).__name__}: {exc}",
-                  elapsed=time.time() - started)
-            return
+            with JOBS_LOCK:
+                job = JOBS.get(job_id)
+                skip = job is None or job.get("state") == "cancelled"
+            if not skip:
+                run_job(job_id, params, attachments)
+        except Exception as exc:  # noqa: BLE001 - a bad job must not end the worker
+            with JOBS_LOCK:
+                if job_id in JOBS:
+                    JOBS[job_id].update(
+                        state="failed", error=f"{type(exc).__name__}: {exc}")
+        finally:
+            JOB_QUEUE.task_done()
+            prune_jobs()
 
-        elapsed = time.time() - started
-        if "video" not in kind and not payload.startswith(b"\x00\x00\x00"):
-            touch(state="failed", elapsed=elapsed,
-                  error=f"non-video response ({kind}): "
-                        f"{payload[:1200].decode('utf-8', 'replace')}")
-            return
 
-        MEDIA.mkdir(exist_ok=True)
-        name = f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}.mp4"
-        (MEDIA / name).write_bytes(payload)
-        (MEDIA / (name + ".json")).write_text(
-            json.dumps({**params, "elapsed": elapsed, "file": name,
-                        "attached": sorted(k for k, v in attachments.items() if v)},
-                       indent=2, ensure_ascii=False))
-        touch(state="done", elapsed=elapsed, file=name, size=len(payload))
+def prune_jobs():
+    """Drop the oldest finished jobs once the history grows past the cap."""
+    with JOBS_LOCK:
+        finished = [j for j in JOBS.values() if j.get("state") in FINAL_STATES]
+        for job in sorted(finished, key=lambda j: j.get("created", 0))[:-MAX_FINISHED]:
+            JOBS.pop(job["id"], None)
+
+
+def job_list():
+    """Every job the queue view needs, newest first, without the attachments."""
+    now = time.time()
+    with JOBS_LOCK:
+        jobs = [dict(job) for job in JOBS.values()]
+    for job in jobs:
+        if job.get("state") == "running" and job.get("started"):
+            job["elapsed"] = now - job["started"]
+    jobs.sort(key=lambda j: j.get("created", 0), reverse=True)
+    waiting = [j["id"] for j in sorted(
+        (j for j in jobs if j.get("state") == "queued"),
+        key=lambda j: j.get("created", 0))]
+    for job in jobs:
+        if job.get("state") == "queued":
+            job["position"] = waiting.index(job["id"]) + 1
+    return jobs
+
+
+def cancel_job(job_id):
+    """Cancel a job that has not started. Returns the resulting state."""
+    with JOBS_LOCK:
+        job = JOBS.get(job_id)
+        if job is None:
+            return None
+        if job.get("state") != "queued":
+            # Running work is already on the GPU and the upstream call is
+            # synchronous, so there is nothing safe to interrupt.
+            return job.get("state")
+        job["state"] = "cancelled"
+        return "cancelled"
+
+
+def queue_position(job_id):
+    """1-based place in line among jobs still waiting, or None if not waiting."""
+    with JOBS_LOCK:
+        waiting = sorted(
+            (j for j in JOBS.values() if j.get("state") == "queued"),
+            key=lambda j: j.get("created", 0))
+    for index, job in enumerate(waiting, 1):
+        if job["id"] == job_id:
+            return index
+    return None
 
 
 def resolve_seed(value):
@@ -269,7 +352,10 @@ def service_status():
         base["model"] = data["data"][0]["id"]
     except Exception as exc:  # noqa: BLE001
         return {**base, "online": False, "detail": f"{type(exc).__name__}: {exc}"}
-    return {**base, "online": True, "busy": GPU_LOCK.locked(),
+    with JOBS_LOCK:
+        busy = any(j.get("state") == "running" for j in JOBS.values())
+        waiting = sum(1 for j in JOBS.values() if j.get("state") == "queued")
+    return {**base, "online": True, "busy": busy, "waiting": waiting,
             "profile": ENV.get("H3_CACHE_BACKEND", "none"),
             "attention": ENV.get("H3_DIFFUSION_ATTENTION_BACKEND", ""),
             "execution": ENV.get("H3_EXECUTION_MODE", "")}
@@ -319,6 +405,8 @@ class Handler(BaseHTTPRequestHandler):
             if job.get("state") == "running":
                 job["elapsed"] = time.time() - job["started"]
             self._send(200, json.dumps(job))
+        elif path == "/api/jobs":
+            self._send(200, json.dumps(job_list()))
         elif path == "/api/history":
             self._send(200, json.dumps(history()))
         elif path.startswith("/media/"):
@@ -338,6 +426,17 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, target.read_bytes(), kind, {"Accept-Ranges": "none"})
 
     def do_POST(self):
+        if self.path.startswith("/api/job/") and self.path.endswith("/cancel"):
+            job_id = self.path[len("/api/job/"):-len("/cancel")]
+            state = cancel_job(job_id)
+            if state is None:
+                self._send(404, json.dumps({"error": "unknown job"}))
+            elif state == "cancelled":
+                self._send(200, json.dumps({"id": job_id, "state": state}))
+            else:
+                self._send(409, json.dumps(
+                    {"error": f"已經在 {state}，無法取消", "state": state}))
+            return
         if self.path != "/api/generate":
             self._send(404, json.dumps({"error": "not found"}))
             return
@@ -401,10 +500,11 @@ class Handler(BaseHTTPRequestHandler):
         job_id = uuid.uuid4().hex
         with JOBS_LOCK:
             JOBS[job_id] = {"id": job_id, "state": "queued", "params": params,
-                            "estimate": estimate_seconds(params)}
-        threading.Thread(target=run_job, args=(job_id, params, attachments),
-                         daemon=True).start()
-        self._send(200, json.dumps({"id": job_id}))
+                            "estimate": estimate_seconds(params),
+                            "created": time.time()}
+        JOB_QUEUE.put((job_id, params, attachments))
+        self._send(200, json.dumps(
+            {"id": job_id, "position": queue_position(job_id)}))
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -452,6 +552,21 @@ INDEX_HTML = r"""<!doctype html>
   .dice:hover:not(:disabled) { border-color: var(--accent); }
   .toggle { display: block; font-size: 12px; color: var(--muted);
     margin-top: 10px; cursor: pointer; letter-spacing: .03em; }
+  .q { display: flex; align-items: center; gap: 10px; padding: 9px 0;
+    border-bottom: 1px solid var(--line); font-size: 13px; }
+  .q:last-child { border-bottom: 0; }
+  .q .txt { flex: 1; min-width: 0; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .q .sub { font-size: 11px; color: var(--muted);
+    font-family: ui-monospace, monospace; }
+  .q .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px;
+    border: 1px solid var(--line); color: var(--muted); flex: none; }
+  .q .tag.run { color: var(--accent); border-color: #2f4a10; }
+  .q .tag.bad { color: var(--danger); border-color: #4a2320; }
+  .q .x { width: auto; flex: none; margin: 0; padding: 3px 9px; font-size: 12px;
+    background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  .q .x:hover { color: var(--danger); border-color: #4a2320; }
+  .q.click { cursor: pointer; }
   button { width: 100%; margin-top: 18px; padding: 11px; font: inherit;
     font-weight: 600; background: var(--accent); color: #0b0d10; border: 0;
     border-radius: 8px; cursor: pointer; }
@@ -552,6 +667,10 @@ INDEX_HTML = r"""<!doctype html>
       <div id="out"></div>
     </div>
     <div class="panel" style="margin-top:24px">
+      <h2>佇列</h2>
+      <div id="queue"></div>
+    </div>
+    <div class="panel" style="margin-top:24px">
       <h2>歷史紀錄</h2>
       <div class="hist" id="hist"></div>
     </div>
@@ -625,7 +744,8 @@ async function poll() {
     }
     if (s.online) {
       $("svc").className = "pill ok";
-      $("svc").textContent = s.busy ? "服務中 · 生成中" : "服務中 · 閒置";
+      $("svc").textContent = (s.busy ? "服務中 · 生成中" : "服務中 · 閒置") +
+        (s.waiting ? " · 佇列 " + s.waiting : "");
       $("prof").textContent = s.attention + " / " + s.execution + " / cache: " + s.profile;
     } else {
       $("svc").className = "pill bad";
@@ -653,6 +773,72 @@ function show(file) {
     <p class="meta">${file} · <a href="/media/${file}" download>下載</a></p>`;
 }
 
+const esc = s => (s || "").replace(/[&<>"]/g, c =>
+  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+const STATE_TAG = {
+  queued: ["", "排隊中"], running: ["run", "生成中"],
+  done: ["", "完成"], failed: ["bad", "失敗"], cancelled: ["", "已取消"]
+};
+
+// null until the first poll: without it, every job already finished before the
+// page opened would be treated as newly done and yank the player around.
+let seenDone = null;
+
+async function loadQueue() {
+  let jobs;
+  try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) { return; }
+
+  const done = jobs.filter(j => j.state === "done");
+  if (seenDone === null) {
+    seenDone = new Set(done.map(j => j.id));
+  } else {
+    const fresh = done.filter(j => !seenDone.has(j.id));
+    fresh.forEach(j => seenDone.add(j.id));
+    if (fresh.length) {
+      const j = fresh[0];   // newest first from the server
+      $("stat").className = "status";
+      $("stat").textContent = "完成，耗時 " + fmt(j.elapsed) +
+        "（" + (j.size / 1048576).toFixed(2) + " MB）· seed " + j.params.seed;
+      show(j.file);
+      loadHistory();
+    }
+  }
+
+  const pending = jobs.filter(j => j.state === "queued" || j.state === "running");
+  const shown = pending.length ? pending
+    : jobs.slice(0, 3);   // nothing waiting: keep the last few for context
+  $("queue").innerHTML = shown.map(j => {
+    const [cls, text] = STATE_TAG[j.state] || ["", j.state];
+    const p = j.params || {};
+    let sub = `${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`;
+    if (j.state === "running") sub += ` · 已 ${fmt(j.elapsed || 0)} / 約 ${fmt(j.estimate || 0)}`;
+    else if (j.state === "queued") sub += ` · 第 ${j.position} 順位`;
+    else if (j.state === "done") sub += ` · ${fmt(j.elapsed || 0)}`;
+    else if (j.state === "failed") sub = esc((j.error || "").split("\n")[0]).slice(0, 120);
+    return `<div class="q${j.state === "done" ? " click" : ""}"${
+        j.state === "done" ? ` onclick="show('${j.file}')"` : ""}>
+      <span class="tag ${cls}">${text}</span>
+      <span class="txt">${esc(p.prompt) || "(無 prompt)"}<br>
+        <span class="sub">${sub}</span></span>
+      ${j.state === "queued"
+        ? `<button class="x" onclick="event.stopPropagation();cancelJob('${j.id}')">取消</button>`
+        : ""}
+    </div>`;
+  }).join("") || '<p class="hint">佇列是空的。</p>';
+}
+
+async function cancelJob(id) {
+  const r = await fetch("/api/job/" + id + "/cancel", {method: "POST"});
+  if (!r.ok) {
+    const {error} = await r.json();
+    $("stat").className = "status err"; $("stat").textContent = error;
+  }
+  loadQueue();
+}
+
+loadQueue(); setInterval(loadQueue, 2000);
+
 const SEED_MAX = 2147483647;
 const rollSeed = () => { $("seed").value = Math.floor(Math.random() * (SEED_MAX + 1)); };
 
@@ -671,7 +857,6 @@ $("go").onclick = async () => {
   $("go").disabled = true;
   $("stat").className = "status";
   $("stat").textContent = "讀取附件…";
-  $("out").innerHTML = "";
 
   const attachments = {};
   if ($("f-image").files[0] && $("att-image").style.display !== "none")
@@ -693,30 +878,17 @@ $("go").onclick = async () => {
       audio_flow_shift: +$("aflow").value, seed: +$("seed").value, attachments
     })
   });
-  const {id, error} = await res.json();
+  const {position, error} = await res.json();
+  $("go").disabled = false;
   if (error) {
     $("stat").className = "status err"; $("stat").textContent = error;
-    $("go").disabled = false; return;
+    return;
   }
-
-  const timer = setInterval(async () => {
-    const j = await (await fetch("/api/job/" + id)).json();
-    if (j.state === "queued") {
-      $("stat").textContent = "排隊中（GPU 正在處理其他請求）…";
-    } else if (j.state === "running") {
-      $("stat").textContent = "生成中… 已經過 " + fmt(j.elapsed) +
-        "，預估約 " + fmt(j.estimate);
-    } else if (j.state === "done") {
-      clearInterval(timer); $("go").disabled = false;
-      $("stat").className = "status";
-      $("stat").textContent = "完成，耗時 " + fmt(j.elapsed) +
-        "（" + (j.size / 1048576).toFixed(2) + " MB）· seed " + j.params.seed;
-      show(j.file); loadHistory();
-    } else if (j.state === "failed") {
-      clearInterval(timer); $("go").disabled = false;
-      $("stat").className = "status err"; $("stat").textContent = j.error;
-    }
-  }, 2000);
+  $("stat").className = "status";
+  $("stat").textContent = position > 1
+    ? "已加入佇列，前面還有 " + (position - 1) + " 個任務。"
+    : "已加入佇列，即將開始。";
+  loadQueue();
 };
 </script>
 </body>
@@ -726,6 +898,7 @@ $("go").onclick = async () => {
 
 if __name__ == "__main__":
     MEDIA.mkdir(exist_ok=True)
+    threading.Thread(target=worker_loop, daemon=True, name="JobQueue").start()
     print(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
     print(f"upstream: {API_BASE}  auth: {'on' if API_KEY else 'off'}")
     print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}")

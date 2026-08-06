@@ -10,6 +10,7 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 
 - **Text, first-frame, and reference conditioning** — task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
 - **Attachment rules enforced before submitting** — each task states what it accepts, and the form refuses mismatched combinations instead of letting the server 400.
+- **A real queue** — submit as many jobs as you like without waiting. One worker drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
 - **Jobs survive the page** — generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a 10-minute render.
 - **Seeds are always recorded** — every result writes a sidecar JSON with the exact parameters. A good result is reproducible by pasting its seed back.
 - **Random seeds** — 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the box and shown on completion, so nothing is lost to chance you can't recover.
@@ -76,4 +77,4 @@ Reported as [vllm-project/vllm-omni#5821](https://github.com/vllm-project/vllm-o
 
 ## License
 
-MIT
+Apache-2.0
