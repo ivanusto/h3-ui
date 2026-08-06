@@ -14,6 +14,7 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 - **Jobs survive the page** — generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a ten-minute render. The finished video appears whenever you come back.
 - **Reproducible by default** — every result writes a sidecar JSON with the exact parameters beside the video.
 - **Random seeds** — 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the seed box and shown on completion, so a lucky result is never lost to a number you can't recover.
+- **Structured prompts** — H3 expects three named sections rather than free text. The form gives you each one, with a format crib sheet, and builds the FL2VA alignment line from the duration you set so its timestamp can't drift out of sync. Plain text still works if you'd rather write it yourself.
 - **Delete what didn't work** — trial runs and failures can be removed from the history, video and sidecar together.
 
 ## Requirements
@@ -93,6 +94,33 @@ The browser UI is just a client of this. Anything it does, you can script.
 | `GET` | `/api/history` | Completed results with their parameters |
 | `DELETE` | `/api/history/<file>` | Delete a result and its sidecar |
 | `GET` | `/media/<file>` | The video itself |
+
+### Prompt format
+
+H3 reads three named sections, [documented upstream](https://github.com/MiniMax-AI/MiniMax-H3/tree/main/skills/h3-prompt-writing). Send them as `description`, `soundscape`, and `music` and they are assembled into H3's field names:
+
+```text
+integrated_multimodal_description: [Shot 1] Live-action, cinematic, a medium-wide shot frames…
+
+overall_soundscape: Wooden shutters scrape open over a quiet street…
+
+non_diegetic_music: A soft acoustic-guitar pattern at a moderate tempo.
+```
+
+`overall_soundscape` is what the characters can hear; `non_diegetic_music` is score only the audience hears — `N/A` for none. Shots are `[Shot 1]`, then `[Shot 2] At 00:03.500, the camera cuts to…`. Camera moves have a fixed vocabulary (`Push In`, `Truck Left`, `Arc Shot`, …) optionally qualified `with small amplitude` / `at slow speed`. Dialogue is `<d>[English] …</d>` with the speaker tagged `(S1)`.
+
+For `fl2va` the guide also wants a leading line stating where each reference picture lands on the timeline. It's generated from `duration` and the last `[Shot N]` in your description, so the timestamp can't disagree with what you actually asked for:
+
+```text
+How the reference pictures align with the target video — Picture 1 (from Shot 1) aligns with the
+0.00-second mark of the target video; Picture 2 (from Shot 1) aligns with the 8.00-second mark…
+```
+
+FL2VA prefers a single shot so the model interpolates continuously between the two frames.
+
+Sending a plain `prompt` instead skips all of this and goes upstream unchanged.
+
+### Request body
 
 `POST /api/generate` takes JSON. A negative or absent `seed` means "draw one":
 

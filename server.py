@@ -319,6 +319,44 @@ def queue_position(job_id):
     return None
 
 
+def compose_prompt(payload, task, duration):
+    """Assemble H3's structured prompt, or pass a plain one straight through.
+
+    H3 expects three named sections rather than free text — see the official
+    prompt guide in MiniMax-AI/MiniMax-H3 under skills/h3-prompt-writing. A
+    plain `prompt` still works and is sent unchanged; supplying `description`
+    switches to the structured form.
+
+    For FL2VA the guide also wants a leading line stating where each reference
+    picture lands on the timeline. Its second timestamp is the video duration,
+    which this process already knows, so it is filled in rather than left for
+    the caller to keep in sync by hand.
+    """
+    description = str(payload.get("description") or "").strip()
+    if not description:
+        return str(payload.get("prompt", "")).strip()
+
+    parts = []
+    if task == "fl2va":
+        # The guide prefers a single shot for FL2VA so the model interpolates
+        # continuously, but honour a multi-shot description if one was written.
+        shots = re.findall(r"\[Shot (\d+)\]", description)
+        last_shot = shots[-1] if shots else "1"
+        parts.append(
+            "How the reference pictures align with the target video — "
+            "Picture 1 (from Shot 1) aligns with the 0.00-second mark of the "
+            f"target video; Picture 2 (from Shot {last_shot}) aligns with the "
+            f"{duration:.2f}-second mark of the target video.")
+
+    parts.append(f"integrated_multimodal_description: {description}")
+    for key, label in (("soundscape", "overall_soundscape"),
+                       ("music", "non_diegetic_music")):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            parts.append(f"{label}: {value}")
+    return "\n\n".join(parts)
+
+
 def resolve_seed(value):
     """Return the seed to run with, drawing a fresh one when asked.
 
@@ -488,15 +526,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": "invalid JSON"}))
             return
 
-        prompt = str(payload.get("prompt", "")).strip()
-        if not prompt:
-            self._send(400, json.dumps({"error": "prompt 不可為空"}))
-            return
         task = str(payload.get("task", "t2va"))
         if task not in PARTITION["tasks"]:
             self._send(400, json.dumps(
                 {"error": f"目前 checkpoint（{PARTITION['partition']}）"
                           f"只支援 {PARTITION['tasks']}"}))
+            return
+
+        try:
+            duration = float(payload.get("duration", 2.0))
+        except (TypeError, ValueError):
+            self._send(400, json.dumps({"error": "duration 必須是數字"}))
+            return
+
+        prompt = compose_prompt(payload, task, duration)
+        if not prompt:
+            self._send(400, json.dumps({"error": "prompt 不可為空"}))
             return
 
         attachments = payload.get("attachments") or {}
@@ -529,12 +574,18 @@ class Handler(BaseHTTPRequestHandler):
             "width": int(payload["width"]) if payload.get("width") else None,
             "height": int(payload["height"]) if payload.get("height") else None,
             "steps": int(payload.get("steps", 20)),
-            "duration": float(payload.get("duration", 2.0)),
+            "duration": duration,
             "fps": int(payload.get("fps", 24)),
             "flow_shift": float(payload.get("flow_shift", 12)),
             "audio_flow_shift": float(payload.get("audio_flow_shift", 3.0)),
             "seed": resolve_seed(payload.get("seed")),
         }
+        # Keep the sections as written when the structured form was used, so a
+        # result can be reopened and edited rather than only re-run verbatim.
+        for key in ("description", "soundscape", "music"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                params[key] = value
         job_id = uuid.uuid4().hex
         with JOBS_LOCK:
             JOBS[job_id] = {"id": job_id, "state": "queued", "params": params,
@@ -605,6 +656,17 @@ INDEX_HTML = r"""<!doctype html>
     background: transparent; color: var(--muted); border: 1px solid var(--line); }
   .q .x:hover { color: var(--danger); border-color: #4a2320; }
   .q.click { cursor: pointer; }
+  .note { text-transform: none; letter-spacing: 0; opacity: .72; font-weight: 400; }
+  label .note::before { content: " · "; }
+  textarea.short { min-height: 58px; }
+  .tips { margin-top: 14px; border: 1px solid var(--line); border-radius: 8px;
+    padding: 10px 12px; font-size: 12px; color: var(--muted); }
+  .tips summary { cursor: pointer; letter-spacing: .03em; }
+  .tips ul { margin: 10px 0 0; padding-left: 18px; }
+  .tips li { margin-bottom: 6px; line-height: 1.5; }
+  .tips code { font-family: ui-monospace, monospace; font-size: 11px;
+    background: #0d0f14; padding: 1px 5px; border-radius: 4px; color: var(--text); }
+  .tips p { margin: 10px 0 0; }
   button { width: 100%; margin-top: 18px; padding: 11px; font: inherit;
     font-weight: 600; background: var(--accent); color: #0b0d10; border: 0;
     border-radius: 8px; cursor: pointer; }
@@ -616,6 +678,11 @@ INDEX_HTML = r"""<!doctype html>
     font-family: ui-monospace, monospace; font-size: 12px; }
   video, .thumb { width: 100%; border-radius: 10px; background: #000; display: block; }
   .thumb { max-height: 150px; object-fit: contain; }
+  /* Portrait clips are the reason for the height cap: at width:100% a 9:16
+     video is taller than the viewport and pushes the history below the fold.
+     Capping height and letting width follow keeps landscape unchanged. */
+  #out video { max-height: 58vh; width: auto; max-width: 100%; margin: 0 auto; }
+  .card video { max-height: 170px; object-fit: contain; }
   .meta { font-size: 12px; color: var(--muted); margin-top: 10px;
     font-family: ui-monospace, monospace; }
   .hist { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
@@ -651,8 +718,40 @@ INDEX_HTML = r"""<!doctype html>
     <label for="task">生成模式</label>
     <select id="task"></select>
 
-    <label for="prompt">Prompt</label>
-    <textarea id="prompt" placeholder="Macro soldering a PCB under warm bench light, soft room tone."></textarea>
+    <label class="toggle" style="margin:14px 0 0"><input id="structured" type="checkbox" checked>
+      結構化 prompt（H3 官方格式）</label>
+
+    <div id="plain-wrap">
+      <label for="prompt">Prompt</label>
+      <textarea id="prompt" placeholder="Macro soldering a PCB under warm bench light, soft room tone."></textarea>
+    </div>
+
+    <div id="struct-wrap">
+      <label for="description">integrated_multimodal_description
+        <span class="note">畫面、動作、運鏡、對白、場景內聲音</span></label>
+      <textarea id="description" placeholder="[Shot 1] Live-action, cinematic, a medium-wide shot frames a baker opening the shutters of a small street bakery before sunrise. The camera pushes in with small amplitude at slow speed as she places a fresh loaf on the wooden counter."></textarea>
+      <p class="hint" id="align-hint" style="display:none"></p>
+
+      <label for="soundscape">overall_soundscape
+        <span class="note">環境音與動作聲，角色聽得到的</span></label>
+      <textarea id="soundscape" class="short" placeholder="Wooden shutters scrape open over a quiet street as trays clink softly inside."></textarea>
+
+      <label for="music">non_diegetic_music
+        <span class="note">配樂，只有觀眾聽得到；不要配樂就填 N/A</span></label>
+      <textarea id="music" class="short" placeholder="A soft acoustic-guitar pattern at a moderate tempo."></textarea>
+
+      <details class="tips">
+        <summary>格式速查</summary>
+        <ul>
+          <li><b>鏡頭</b>：<code>[Shot 1]</code> 起頭並註明風格與構圖；後續鏡頭 <code>[Shot 2] At 00:03.500, the camera cuts to…</code>（首個鏡頭不加時間）</li>
+          <li><b>運鏡</b>：<code>Push In / Pull Out / Truck Left / Pan Right / Tilt Up / Arc Shot / Tracking Shot / Static Shot / POV</code>，可加 <code>with small amplitude</code>、<code>at slow speed</code></li>
+          <li><b>對白</b>：<code>&lt;d&gt;[English] First batch of the morning.&lt;/d&gt;</code>，說話者標 <code>(S1)</code></li>
+          <li><b>風格</b>：<code>Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film</code></li>
+          <li><b>FL2VA</b> 偏好單一鏡頭，讓模型連續內插；對齊指令會依秒數自動帶入</li>
+        </ul>
+        <p>依據官方 <a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt" target="_blank" rel="noreferrer">h3-prompt-writing</a> 指引。</p>
+      </details>
+    </div>
 
     <fieldset id="att" style="display:none">
       <legend>參考輸入</legend>
@@ -752,6 +851,7 @@ function syncTask() {
   $("att-video").style.display = t === "ref2va" ? "block" : "none";
   $("att-rule").textContent = RULES[t] || "";
   estimate();
+  syncAlignHint();
 }
 $("task").onchange = syncTask;
 $("preset").onchange = () => {
@@ -761,6 +861,8 @@ $("preset").onchange = () => {
   estimate();
 };
 ["steps", "duration", "width", "height"].forEach(id => $(id).oninput = estimate);
+$("duration").addEventListener("input", syncAlignHint);
+syncStructured();
 
 $("f-image").onchange = async () => {
   const f = $("f-image").files[0];
@@ -907,6 +1009,32 @@ loadQueue(); setInterval(loadQueue, 2000);
 const SEED_MAX = 2147483647;
 const rollSeed = () => { $("seed").value = Math.floor(Math.random() * (SEED_MAX + 1)); };
 
+function syncStructured() {
+  const on = $("structured").checked;
+  $("struct-wrap").style.display = on ? "block" : "none";
+  $("plain-wrap").style.display = on ? "none" : "block";
+  syncAlignHint();
+}
+
+// FL2VA wants a leading line naming where each reference picture lands on the
+// timeline. The server fills it in from the duration; showing it here means the
+// number in the prompt can't silently disagree with the form.
+function syncAlignHint() {
+  const el = $("align-hint");
+  if (!$("structured").checked || $("task").value !== "fl2va") {
+    el.style.display = "none"; return;
+  }
+  const secs = (+$("duration").value || 0).toFixed(2);
+  const shots = ($("description").value.match(/\[Shot (\d+)\]/g) || []);
+  const last = shots.length ? shots[shots.length - 1].match(/\d+/)[0] : "1";
+  el.style.display = "block";
+  el.textContent = "會自動加在最前面：Picture 1 (from Shot 1) → 0.00 秒；" +
+    "Picture 2 (from Shot " + last + ") → " + secs + " 秒";
+}
+
+$("structured").onchange = syncStructured;
+$("description").oninput = syncAlignHint;
+
 $("dice").onclick = rollSeed;
 // Randomising keeps writing the drawn seed into the box rather than hiding it,
 // so a good result stays reproducible: untick and the value is already there.
@@ -916,8 +1044,19 @@ $("rand").onchange = () => {
 };
 
 $("go").onclick = async () => {
-  const prompt = $("prompt").value.trim();
-  if (!prompt) { $("stat").textContent = "請先輸入 prompt。"; return; }
+  const structured = $("structured").checked;
+  const text = structured
+    ? {description: $("description").value.trim(),
+       soundscape: $("soundscape").value.trim(),
+       music: $("music").value.trim()}
+    : {prompt: $("prompt").value.trim()};
+  if (structured ? !text.description : !text.prompt) {
+    $("stat").className = "status";
+    $("stat").textContent = structured
+      ? "請先填寫 integrated_multimodal_description。"
+      : "請先輸入 prompt。";
+    return;
+  }
   const [width, height] = dims();
   $("go").disabled = true;
   $("stat").className = "status";
@@ -937,7 +1076,7 @@ $("go").onclick = async () => {
   const res = await fetch("/api/generate", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
-      task: $("task").value, prompt, width, height,
+      task: $("task").value, ...text, width, height,
       steps: +$("steps").value, duration: +$("duration").value,
       fps: +$("fps").value, flow_shift: +$("flow").value,
       audio_flow_shift: +$("aflow").value, seed: +$("seed").value, attachments
