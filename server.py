@@ -425,6 +425,42 @@ class Handler(BaseHTTPRequestHandler):
         kind = mimetypes.guess_type(name)[0] or "application/octet-stream"
         self._send(200, target.read_bytes(), kind, {"Accept-Ranges": "none"})
 
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/api/history/"):
+            self.delete_media(path[len("/api/history/"):])
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+
+    def delete_media(self, name):
+        """Delete one result and its sidecar. Unlinking, so no undo."""
+        # Only ever a generated filename: no separators, and it must be the
+        # .mp4 — the sidecar goes with it rather than being deletable alone.
+        if not re.fullmatch(r"[A-Za-z0-9._-]+\.mp4", name) or ".." in name:
+            self._send(400, json.dumps({"error": "bad name"}))
+            return
+        root = MEDIA.resolve()
+        target = (MEDIA / name).resolve()
+        # Belt and braces: the pattern already excludes separators, but a
+        # symlinked media dir could still land the resolved path elsewhere.
+        if target.parent != root:
+            self._send(400, json.dumps({"error": "bad name"}))
+            return
+        if not target.is_file():
+            self._send(404, json.dumps({"error": "not found"}))
+            return
+        removed = []
+        for path in (target, root / (name + ".json")):
+            try:
+                path.unlink()
+                removed.append(path.name)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                self._send(500, json.dumps({"error": f"{type(exc).__name__}: {exc}"}))
+                return
+        self._send(200, json.dumps({"deleted": removed}))
+
     def do_POST(self):
         if self.path.startswith("/api/job/") and self.path.endswith("/cancel"):
             job_id = self.path[len("/api/job/"):-len("/cancel")]
@@ -583,7 +619,13 @@ INDEX_HTML = r"""<!doctype html>
   .hist { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
     gap: 14px; margin-top: 14px; }
   .card { border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
-    background: #0d0f14; cursor: pointer; }
+    background: #0d0f14; cursor: pointer; position: relative; }
+  .card .del { position: absolute; top: 6px; right: 6px; width: auto; margin: 0;
+    padding: 2px 7px; font-size: 12px; line-height: 1.4; border-radius: 6px;
+    background: rgba(8,10,14,.78); color: var(--muted);
+    border: 1px solid var(--line); opacity: 0; transition: opacity .12s; }
+  .card:hover .del, .card .del:focus { opacity: 1; }
+  .card .del:hover { color: var(--danger); border-color: #4a2320; }
   .card video { border-radius: 0; }
   .card div { padding: 8px 10px; font-size: 11px; color: var(--muted);
     font-family: ui-monospace, monospace; }
@@ -759,18 +801,39 @@ poll(); setInterval(poll, 5000);
 async function loadHistory() {
   const items = await (await fetch("/api/history")).json();
   $("hist").innerHTML = items.map(i => `
-    <div class="card" onclick="show('${i.file}')">
-      <video src="/media/${i.file}" muted preload="metadata"></video>
-      <div>${i.task || "t2va"} · ${i.width || "auto"}×${i.height || "auto"} ·
+    <div class="card">
+      <button class="del" title="刪除這支影片與它的參數檔"
+        onclick="delMedia('${i.file}')">✕</button>
+      <video src="/media/${i.file}" muted preload="metadata"
+        onclick="show('${i.file}')"></video>
+      <div onclick="show('${i.file}')">${i.task || "t2va"} ·
+        ${i.width || "auto"}×${i.height || "auto"} ·
         ${i.steps} steps · seed ${i.seed}<br>${fmt(i.elapsed)}${
         (i.attached || []).length ? " · 附件: " + i.attached.join(",") : ""}</div>
     </div>`).join("") || '<p class="hint">尚無紀錄。</p>';
 }
+
+// Deletion unlinks the file — there is no trash to recover it from, so the
+// confirm carries the filename rather than a generic "are you sure".
+let shownFile = null;
+async function delMedia(file) {
+  if (!confirm("刪除 " + file + " ？\n影片與參數檔會一起移除，無法復原。")) return;
+  const r = await fetch("/api/history/" + encodeURIComponent(file), {method: "DELETE"});
+  if (!r.ok) {
+    const {error} = await r.json().catch(() => ({error: "刪除失敗"}));
+    $("stat").className = "status err"; $("stat").textContent = error;
+    return;
+  }
+  if (shownFile === file) { $("out").innerHTML = ""; shownFile = null; }
+  loadHistory();
+}
 loadHistory();
 
 function show(file) {
+  shownFile = file;
   $("out").innerHTML = `<video src="/media/${file}" controls autoplay></video>
-    <p class="meta">${file} · <a href="/media/${file}" download>下載</a></p>`;
+    <p class="meta">${file} · <a href="/media/${file}" download>下載</a> ·
+      <a href="#" onclick="delMedia('${file}');return false">刪除</a></p>`;
 }
 
 const esc = s => (s || "").replace(/[&<>"]/g, c =>

@@ -8,19 +8,17 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 
 ## What it does
 
-- **Text, first-frame, and reference conditioning** — task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
+- **Text, first-frame, and reference conditioning** — the task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
 - **Attachment rules enforced before submitting** — each task states what it accepts, and the form refuses mismatched combinations instead of letting the server 400.
-- **A real queue** — submit as many jobs as you like without waiting. One worker drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
-- **Jobs survive the page** — generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a 10-minute render.
-- **Seeds are always recorded** — every result writes a sidecar JSON with the exact parameters. A good result is reproducible by pasting its seed back.
-- **Random seeds** — 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the box and shown on completion, so nothing is lost to chance you can't recover.
-- **History** — past generations are listed with their parameters and play inline.
-
-Requests are serialised behind a lock: one generation at a time, which is what a single-GPU box wants anyway.
+- **A real queue** — submit as many jobs as you like without waiting. A single worker drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
+- **Jobs survive the page** — generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a ten-minute render. The finished video appears whenever you come back.
+- **Reproducible by default** — every result writes a sidecar JSON with the exact parameters beside the video.
+- **Random seeds** — 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the seed box and shown on completion, so a lucky result is never lost to a number you can't recover.
+- **Delete what didn't work** — trial runs and failures can be removed from the history, video and sidecar together.
 
 ## Requirements
 
-- Python 3.10+ (standard library only — nothing to install)
+- Python 3.10+ — standard library only, nothing to install
 - A reachable vLLM-Omni server serving a video model
 
 ## Setup
@@ -31,9 +29,13 @@ $EDITOR .env          # set H3_API_BASE, and H3_API_KEY if the server needs one
 python3 server.py
 ```
 
+Then open the address it prints.
+
 If you run the [MiniMax-H3-DGX-Spark](https://github.com/joeynyc/MiniMax-H3-DGX-Spark) deployment repo, its `.env` is picked up automatically and a local one is optional.
 
-Configuration resolves in this order: process environment → `.env` → default.
+### Configuration
+
+Resolved in order: process environment → `.env` → default.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -43,17 +45,23 @@ Configuration resolves in this order: process environment → `.env` → default
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
 
-**On binding beyond loopback:** this process holds your API key and will proxy anything a browser asks it to. Binding to a LAN address hands that to everyone on the network — do it deliberately, on a network you trust.
+## Security
 
-## Scope
+**This process holds your API key and will proxy whatever a browser asks of it.** There is no authentication on the UI itself — that is deliberate for a loopback tool, and it is exactly why the default bind is `127.0.0.1`.
 
-The server contract is vLLM-Omni's `POST /v1/videos/sync`. The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific — a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
+Setting `H3_UI_HOST` to a LAN address hands your API key's capabilities to everyone who can reach that port. Do it only on a network you trust, and prefer an SSH tunnel if you just need it from another machine:
 
-Image generation is **not** implemented. vLLM-Omni does expose `/v1/images/generations` and `/v1/images/edits`, so adding it is a matter of a task mode and a shorter result pane rather than new plumbing — whether it produces anything depends on the model actually loaded.
+```sh
+ssh -L 8080:127.0.0.1:8080 user@gpu-box
+```
 
-## Reproducing a result
+Deleting a result unlinks it immediately. There is no trash, and the browser's confirm dialog is the only thing between a click and a gone file.
 
-Every `media/*.mp4` has a `.mp4.json` beside it:
+## Usage notes
+
+**Queue.** Submitting adds to the queue and returns its position; the form stays usable so you can queue several variations at once. The queue panel shows what's waiting, what's running with elapsed against estimated time, and lets you cancel anything that hasn't started.
+
+**Reproducing a result.** Every `media/*.mp4` has a `.mp4.json` beside it:
 
 ```json
 {
@@ -69,9 +77,58 @@ Every `media/*.mp4` has a `.mp4.json` beside it:
 
 Paste those values back into the form — with the random checkbox off — and you get the same video.
 
+**Estimates** are extrapolated from one measured run, scaling with `width × height × steps × duration`. Treat them as an order of magnitude, not a promise; caching and step-time drift move the real number around.
+
+## HTTP API
+
+The browser UI is just a client of this. Anything it does, you can script.
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/status` | Upstream reachability, partition, task list, queue depth |
+| `POST` | `/api/generate` | Queue a job; returns `{id, position}` |
+| `GET` | `/api/jobs` | Whole queue plus recent finished jobs |
+| `GET` | `/api/job/<id>` | One job's state |
+| `POST` | `/api/job/<id>/cancel` | Cancel a queued job (409 if it already started) |
+| `GET` | `/api/history` | Completed results with their parameters |
+| `DELETE` | `/api/history/<file>` | Delete a result and its sidecar |
+| `GET` | `/media/<file>` | The video itself |
+
+`POST /api/generate` takes JSON. A negative or absent `seed` means "draw one":
+
+```sh
+curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d '{
+  "task": "t2va",
+  "prompt": "Rain on a window at night, soft patter.",
+  "width": 768, "height": 448,
+  "steps": 20, "duration": 2.0, "fps": 24,
+  "flow_shift": 12, "audio_flow_shift": 3.0,
+  "seed": -1,
+  "attachments": {}
+}'
+```
+
+Attachments are data URLs: `{"image": "data:image/png;base64,..."}`, or `{"videos": [...]}` for reference conditioning.
+
+## Scope
+
+The server contract is vLLM-Omni's `POST /v1/videos/sync`. The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific — a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
+
+Image generation is **not** implemented. vLLM-Omni does expose `/v1/images/generations` and `/v1/images/edits`, so adding it is a matter of a task mode and a shorter result pane rather than new plumbing — whether it produces anything depends on the model actually loaded.
+
+Other things it deliberately doesn't do: no user accounts, no multi-GPU scheduling, no database. Jobs live in memory, so a restart forgets the queue — finished videos are on disk and survive.
+
+## Project layout
+
+```
+server.py       everything: HTTP handler, queue worker, and the page itself
+.env.example    configuration template
+media/          generated videos and their sidecar JSON (gitignored)
+```
+
 ## A note on long generations
 
-vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which upstream sets to 30 s. If a single denoise step runs longer than that, the output future is cancelled and the server's result-pump thread dies — after which `/health` keeps answering 200 while no request ever returns again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44–48 s per step here.
+vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which upstream sets to 30 s. If a single denoise step runs longer than that, the output future is cancelled and the server's result-pump thread dies — after which `/health` keeps answering 200 while no request ever returns again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44–48 s per step on the box this was written against.
 
 Reported as [vllm-project/vllm-omni#5821](https://github.com/vllm-project/vllm-omni/issues/5821), with a build-time fix in [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4). Worth patching before you push step counts up; this frontend can't work around it.
 
