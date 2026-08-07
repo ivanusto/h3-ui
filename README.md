@@ -1,5 +1,7 @@
 # h3-ui
 
+**English** | [繁體中文](README.zh-TW.md)
+
 A thin browser frontend for video generation on a [vLLM-Omni](https://github.com/vllm-project/vllm-omni) server.
 
 One file, standard library only, no build step. Point it at a running server and open a browser.
@@ -45,6 +47,17 @@ Resolved in order: process environment → `.env` → default.
 | `H3_UI_HOST` | `127.0.0.1` | UI bind address |
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
+
+## Language
+
+The interface comes in English and Traditional Chinese, chosen from the browser:
+**Traditional Chinese locales (`zh-TW` / `zh-Hant` / `zh-HK` / `zh-MO`) get Chinese;
+everything else — `zh-CN` included — gets English.** The link in the header switches
+by hand, and the choice is remembered in that browser's `localStorage`.
+
+Server-side error messages follow the same choice: the page sends `X-Lang` with every
+API call and the server falls back to `Accept-Language` when it is absent, so `curl`
+gets messages in its own locale too.
 
 ## Security
 
@@ -94,6 +107,9 @@ The browser UI is just a client of this. Anything it does, you can script.
 | `GET` | `/api/history` | Completed results with their parameters |
 | `DELETE` | `/api/history/<file>` | Delete a result and its sidecar |
 | `GET` | `/media/<file>` | The video itself |
+
+Every endpoint accepts `X-Lang: en` or `X-Lang: zh` to pick the language of its error
+messages; without it, `Accept-Language` decides.
 
 ### Prompt format
 

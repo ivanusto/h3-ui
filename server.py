@@ -55,10 +55,76 @@ REF_SECONDS = 84.0
 SEED_MAX = 2**31 - 1
 
 TASK_LABELS = {
-    "t2va": "文字 → 影片＋音訊",
-    "fl2va": "首格圖片 → 影片＋音訊",
-    "ref2va": "參考條件 → 影片＋音訊",
+    "en": {
+        "t2va": "text → video + audio",
+        "fl2va": "first frame → video + audio",
+        "ref2va": "reference → video + audio",
+    },
+    "zh": {
+        "t2va": "文字 → 影片＋音訊",
+        "fl2va": "首格圖片 → 影片＋音訊",
+        "ref2va": "參考條件 → 影片＋音訊",
+    },
 }
+
+# Only Traditional Chinese gets the Chinese page; zh-CN and everything else
+# fall through to English. Matched against X-Lang first (the page's own
+# override) and then the browser's Accept-Language.
+ZH_HANT = re.compile(r"\bzh[-_](hant|tw|hk|mo)", re.I)
+
+MESSAGES = {
+    "en": {
+        "attachment_data_url": "Attachments must be base64 data URLs",
+        "attachment_decode": "Attachment base64 decode failed: {error}",
+        "body_too_large": "Attachments too large (512 MB limit)",
+        "duration_number": "duration must be a number",
+        "fl2va_image_only": "fl2va takes an image only, not audio or video",
+        "fl2va_needs_image": "fl2va needs one first-frame image",
+        "forget_state": "Still {state}; cannot remove it from the list",
+        "cancel_state": "Already {state}; cannot cancel",
+        "prompt_required": "prompt cannot be empty",
+        "ref2va_pair_or_video":
+            "ref2va needs an image + audio pair, or one or more reference videos",
+        "ref2va_video_exclusive":
+            "ref2va's reference-video mode keeps the video's own audio; "
+            "don't attach an image or audio as well",
+        "t2va_no_attachments": "t2va takes no attachments",
+        "task_unsupported":
+            "The loaded checkpoint ({partition}) only supports {tasks}",
+    },
+    "zh": {
+        "attachment_data_url": "附件必須是 base64 data URL",
+        "attachment_decode": "附件 base64 解碼失敗: {error}",
+        "body_too_large": "附件過大（上限 512 MB）",
+        "duration_number": "duration 必須是數字",
+        "fl2va_image_only": "fl2va 只接受圖片，不接受音訊或影片",
+        "fl2va_needs_image": "fl2va 必須提供一張首格圖片",
+        "forget_state": "還在 {state}，無法從清單移除",
+        "cancel_state": "已經在 {state}，無法取消",
+        "prompt_required": "prompt 不可為空",
+        "ref2va_pair_or_video": "ref2va 需要「圖片＋音訊」成對，或一支以上參考影片",
+        "ref2va_video_exclusive": "ref2va 的參考影片模式沿用影片原聲，不可再附圖片或音訊",
+        "t2va_no_attachments": "t2va 不接受任何附件",
+        "task_unsupported": "目前 checkpoint（{partition}）只支援 {tasks}",
+    },
+}
+
+
+def pick_lang(explicit, accept=""):
+    """The page's own choice wins; otherwise sniff the browser's locales.
+
+    `explicit` is X-Lang, which the page sends as a bare "en"/"zh" — it is the
+    toggle's answer, not a locale, so it is matched before the regex that only
+    Traditional Chinese locale tags satisfy.
+    """
+    if explicit in MESSAGES:
+        return explicit
+    return "zh" if ZH_HANT.search(f"{explicit or ''} {accept or ''}") else "en"
+
+
+def t(lang, key, **kw):
+    table = MESSAGES.get(lang) or MESSAGES["en"]
+    return table[key].format(**kw)
 
 
 def load_env():
@@ -124,15 +190,15 @@ def auth_headers():
     return {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 
-def split_data_url(value):
+def split_data_url(value, lang="en"):
     """Return (mime, raw_bytes) from a data: URL."""
     match = re.fullmatch(r"data:([^;,]+);base64,(.+)", value or "", re.S)
     if not match:
-        raise ValueError("附件必須是 base64 data URL")
+        raise ValueError(t(lang, "attachment_data_url"))
     try:
         return match.group(1), base64.b64decode(match.group(2), validate=True)
     except binascii.Error as exc:
-        raise ValueError(f"附件 base64 解碼失敗: {exc}") from exc
+        raise ValueError(t(lang, "attachment_decode", error=exc)) from exc
 
 
 def encode_multipart(fields, files):
@@ -156,7 +222,7 @@ def encode_multipart(fields, files):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
-def build_request(params, attachments):
+def build_request(params, attachments, lang="en"):
     """Translate UI parameters into the vLLM-Omni video request."""
     extra = {"task": params["task"], "duration": params["duration"],
              "audio_flow_shift": params["audio_flow_shift"]}
@@ -180,25 +246,30 @@ def build_request(params, attachments):
     videos = attachments.get("videos") or []
 
     if image:
-        mime, blob = split_data_url(image)
+        mime, blob = split_data_url(image, lang)
         # input_reference is sniffed server-side into an image or video.
         files.append(("input_reference", "reference" +
                       (mimetypes.guess_extension(mime) or ".png"), mime, blob))
     if videos:
         name = "input_references" if len(videos) > 1 else "input_reference"
         for index, item in enumerate(videos):
-            mime, blob = split_data_url(item)
+            mime, blob = split_data_url(item, lang)
             files.append((name, f"reference-{index}" +
                           (mimetypes.guess_extension(mime) or ".mp4"), mime, blob))
     if audio:
-        mime, _ = split_data_url(audio)
+        mime, _ = split_data_url(audio, lang)
         fields["audio_reference"] = json.dumps({"audio_url": audio})
 
     return fields, files
 
 
-def run_job(job_id, params, attachments):
-    """Run one generation to completion. Called only by the queue worker."""
+def run_job(job_id, params, attachments, lang="en"):
+    """Run one generation to completion. Called only by the queue worker.
+
+    `lang` is the submitting page's language: a job can fail long after the
+    request that queued it, so the language travels with the job rather than
+    being read off whichever request happens to collect the error.
+    """
     def touch(**kw):
         with JOBS_LOCK:
             if job_id in JOBS:
@@ -207,7 +278,7 @@ def run_job(job_id, params, attachments):
     started = time.time()
     touch(state="running", started=started)
     try:
-        fields, files = build_request(params, attachments)
+        fields, files = build_request(params, attachments, lang)
     except ValueError as exc:
         touch(state="failed", error=str(exc), elapsed=0)
         return
@@ -250,13 +321,13 @@ def run_job(job_id, params, attachments):
 def worker_loop():
     """Drain the queue forever, one job at a time, in submission order."""
     while True:
-        job_id, params, attachments = JOB_QUEUE.get()
+        job_id, params, attachments, lang = JOB_QUEUE.get()
         try:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
                 skip = job is None or job.get("state") == "cancelled"
             if not skip:
-                run_job(job_id, params, attachments)
+                run_job(job_id, params, attachments, lang)
         except Exception as exc:  # noqa: BLE001 - a bad job must not end the worker
             with JOBS_LOCK:
                 if job_id in JOBS:
@@ -410,10 +481,11 @@ def estimate_seconds(params):
     return round(REF_SECONDS * cost / REF_COST)
 
 
-def service_status():
+def service_status(lang="en"):
     request = urllib.request.Request(f"{API_BASE}/v1/models", headers=auth_headers())
     base = {"api_base": API_BASE, "partition": PARTITION["partition"],
-            "tasks": PARTITION["tasks"], "labels": TASK_LABELS}
+            "tasks": PARTITION["tasks"],
+            "labels": TASK_LABELS.get(lang, TASK_LABELS["en"])}
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
             data = json.load(response)
@@ -447,6 +519,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    @property
+    def lang(self):
+        """X-Lang is the page's explicit choice; Accept-Language is the default."""
+        return pick_lang(self.headers.get("X-Lang"),
+                         self.headers.get("Accept-Language"))
+
     def _send(self, code, body, content_type="application/json", extra=None):
         if isinstance(body, str):
             body = body.encode()
@@ -463,7 +541,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             self._send(200, INDEX_HTML, "text/html; charset=utf-8")
         elif path == "/api/status":
-            self._send(200, json.dumps(service_status()))
+            self._send(200, json.dumps(service_status(self.lang)))
         elif path.startswith("/api/job/"):
             with JOBS_LOCK:
                 job = dict(JOBS.get(path.rsplit("/", 1)[-1], {}))
@@ -508,7 +586,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"id": job_id, "state": state}))
             else:
                 self._send(409, json.dumps(
-                    {"error": f"還在 {state}，無法從清單移除", "state": state}))
+                    {"error": t(self.lang, "forget_state", state=state),
+                     "state": state}))
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
@@ -554,14 +633,16 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"id": job_id, "state": state}))
             else:
                 self._send(409, json.dumps(
-                    {"error": f"已經在 {state}，無法取消", "state": state}))
+                    {"error": t(self.lang, "cancel_state", state=state),
+                     "state": state}))
             return
         if self.path != "/api/generate":
             self._send(404, json.dumps({"error": "not found"}))
             return
+        lang = self.lang
         length = int(self.headers.get("Content-Length", "0"))
         if length > MAX_BODY:
-            self._send(413, json.dumps({"error": "附件過大（上限 512 MB）"}))
+            self._send(413, json.dumps({"error": t(lang, "body_too_large")}))
             return
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
@@ -572,19 +653,20 @@ class Handler(BaseHTTPRequestHandler):
         task = str(payload.get("task", "t2va"))
         if task not in PARTITION["tasks"]:
             self._send(400, json.dumps(
-                {"error": f"目前 checkpoint（{PARTITION['partition']}）"
-                          f"只支援 {PARTITION['tasks']}"}))
+                {"error": t(lang, "task_unsupported",
+                            partition=PARTITION["partition"],
+                            tasks=PARTITION["tasks"])}))
             return
 
         try:
             duration = float(payload.get("duration", 2.0))
         except (TypeError, ValueError):
-            self._send(400, json.dumps({"error": "duration 必須是數字"}))
+            self._send(400, json.dumps({"error": t(lang, "duration_number")}))
             return
 
         prompt = compose_prompt(payload, task, duration)
         if not prompt:
-            self._send(400, json.dumps({"error": "prompt 不可為空"}))
+            self._send(400, json.dumps({"error": t(lang, "prompt_required")}))
             return
 
         attachments = payload.get("attachments") or {}
@@ -596,19 +678,19 @@ class Handler(BaseHTTPRequestHandler):
         # spending a cold request on a rejected combination.
         problem = None
         if task == "t2va" and (image or audio or videos):
-            problem = "t2va 不接受任何附件"
+            problem = "t2va_no_attachments"
         elif task == "fl2va":
             if not image:
-                problem = "fl2va 必須提供一張首格圖片"
+                problem = "fl2va_needs_image"
             elif audio or videos:
-                problem = "fl2va 只接受圖片，不接受音訊或影片"
+                problem = "fl2va_image_only"
         elif task == "ref2va":
             if videos and (image or audio):
-                problem = "ref2va 的參考影片模式沿用影片原聲，不可再附圖片或音訊"
+                problem = "ref2va_video_exclusive"
             elif not videos and not (image and audio):
-                problem = "ref2va 需要「圖片＋音訊」成對，或一支以上參考影片"
+                problem = "ref2va_pair_or_video"
         if problem:
-            self._send(400, json.dumps({"error": problem}))
+            self._send(400, json.dumps({"error": t(lang, problem)}))
             return
 
         params = {
@@ -634,13 +716,13 @@ class Handler(BaseHTTPRequestHandler):
             JOBS[job_id] = {"id": job_id, "state": "queued", "params": params,
                             "estimate": estimate_seconds(params),
                             "created": time.time()}
-        JOB_QUEUE.put((job_id, params, attachments))
+        JOB_QUEUE.put((job_id, params, attachments, lang))
         self._send(200, json.dumps(
             {"id": job_id, "position": queue_position(job_id)}))
 
 
 INDEX_HTML = r"""<!doctype html>
-<html lang="zh-Hant">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -660,6 +742,8 @@ INDEX_HTML = r"""<!doctype html>
     border: 1px solid var(--line); color: var(--muted); }
   .pill.ok { color: var(--accent); border-color: #2f4a10; }
   .pill.bad { color: var(--danger); border-color: #4a2320; }
+  .pill.link { margin-left: auto; cursor: pointer; text-decoration: none; }
+  .pill.link:hover { color: var(--text); border-color: var(--accent); }
   main { display: grid; grid-template-columns: minmax(340px, 430px) 1fr;
     gap: 24px; padding: 24px; align-items: start; }
   /* Grid items default to min-width:auto, so one long unbroken line — a
@@ -759,17 +843,18 @@ INDEX_HTML = r"""<!doctype html>
 <body>
 <header>
   <h1>MiniMax H3</h1>
-  <span class="pill" id="svc">連線中…</span>
+  <span class="pill" id="svc" data-i18n="hdr.connecting"></span>
   <span class="pill" id="part"></span>
   <span class="pill" id="prof"></span>
+  <a class="pill link" id="lang" href="#" data-i18n="lang.other"></a>
 </header>
 <main>
   <section class="panel">
-    <label for="task">生成模式</label>
+    <label for="task" data-i18n="label.mode"></label>
     <select id="task"></select>
 
     <label class="toggle" style="margin:14px 0 0"><input id="structured" type="checkbox" checked>
-      結構化 prompt（H3 官方格式）</label>
+      <span data-i18n="opt.structured"></span></label>
 
     <div id="plain-wrap">
       <label for="prompt">Prompt</label>
@@ -778,64 +863,58 @@ INDEX_HTML = r"""<!doctype html>
 
     <div id="struct-wrap">
       <label for="description">integrated_multimodal_description
-        <span class="note">畫面、動作、運鏡、對白、場景內聲音</span></label>
+        <span class="note" data-i18n="note.description"></span></label>
       <textarea id="description" placeholder="[Shot 1] Live-action, cinematic, a medium-wide shot frames a baker opening the shutters of a small street bakery before sunrise. The camera pushes in with small amplitude at slow speed as she places a fresh loaf on the wooden counter."></textarea>
       <p class="hint" id="align-hint" style="display:none"></p>
 
       <label for="soundscape">overall_soundscape
-        <span class="note">環境音與動作聲，角色聽得到的</span></label>
+        <span class="note" data-i18n="note.soundscape"></span></label>
       <textarea id="soundscape" class="short" placeholder="Wooden shutters scrape open over a quiet street as trays clink softly inside."></textarea>
 
       <label for="music">non_diegetic_music
-        <span class="note">配樂，只有觀眾聽得到；不要配樂就填 N/A</span></label>
+        <span class="note" data-i18n="note.music"></span></label>
       <textarea id="music" class="short" placeholder="A soft acoustic-guitar pattern at a moderate tempo."></textarea>
 
       <details class="tips">
-        <summary>格式速查</summary>
-        <ul>
-          <li><b>鏡頭</b>：<code>[Shot 1]</code> 起頭並註明風格與構圖；後續鏡頭 <code>[Shot 2] At 00:03.500, the camera cuts to…</code>（首個鏡頭不加時間）</li>
-          <li><b>運鏡</b>：<code>Push In / Pull Out / Truck Left / Pan Right / Tilt Up / Arc Shot / Tracking Shot / Static Shot / POV</code>，可加 <code>with small amplitude</code>、<code>at slow speed</code></li>
-          <li><b>對白</b>：<code>&lt;d&gt;[English] First batch of the morning.&lt;/d&gt;</code>，說話者標 <code>(S1)</code></li>
-          <li><b>風格</b>：<code>Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film</code></li>
-          <li><b>FL2VA</b> 偏好單一鏡頭，讓模型連續內插；對齊指令會依秒數自動帶入</li>
-        </ul>
-        <p>依據官方 <a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt" target="_blank" rel="noreferrer">h3-prompt-writing</a> 指引。</p>
+        <summary data-i18n="tips.summary"></summary>
+        <ul data-i18n-html="tips.list"></ul>
+        <p data-i18n-html="tips.source"></p>
       </details>
     </div>
 
     <fieldset id="att" style="display:none">
-      <legend>參考輸入</legend>
+      <legend data-i18n="att.legend"></legend>
       <div id="att-image" style="display:none">
-        <label for="f-image">首格圖片 / 參考圖片</label>
+        <label for="f-image" data-i18n="att.image"></label>
         <input id="f-image" type="file" accept="image/*">
         <img id="pv-image" class="thumb" style="display:none; margin-top:10px">
       </div>
       <div id="att-audio" style="display:none">
-        <label for="f-audio">參考音訊</label>
+        <label for="f-audio" data-i18n="att.audio"></label>
         <input id="f-audio" type="file" accept="audio/*">
       </div>
       <div id="att-video" style="display:none">
-        <label for="f-video">參考影片（可多選，沿用其原聲）</label>
+        <label for="f-video" data-i18n="att.video"></label>
         <input id="f-video" type="file" accept="video/*" multiple>
       </div>
       <p class="hint" id="att-rule"></p>
     </fieldset>
 
-    <label for="preset">解析度</label>
+    <label for="preset" data-i18n="label.resolution"></label>
     <select id="preset">
-      <option value="768x448">768 × 448 — 已驗證，快速</option>
-      <option value="1344x768">1344 × 768 — 已驗證，品質</option>
-      <option value="custom">自訂</option>
-      <option value="auto">依參考圖片比例自動</option>
+      <option value="768x448" data-i18n="preset.fast"></option>
+      <option value="1344x768" data-i18n="preset.quality"></option>
+      <option value="custom" data-i18n="preset.custom"></option>
+      <option value="auto" data-i18n="preset.auto"></option>
     </select>
     <div class="row" id="wh" style="margin-top:12px; display:none">
-      <div><label for="width">寬</label><input id="width" type="number" value="768" step="32"></div>
-      <div><label for="height">高</label><input id="height" type="number" value="448" step="32"></div>
+      <div><label for="width" data-i18n="label.width"></label><input id="width" type="number" value="768" step="32"></div>
+      <div><label for="height" data-i18n="label.height"></label><input id="height" type="number" value="448" step="32"></div>
     </div>
 
     <div class="row3">
       <div><label for="steps">Steps</label><input id="steps" type="number" value="20" min="1" max="200"></div>
-      <div><label for="duration">秒數</label><input id="duration" type="number" value="2.0" step="0.5" min="0.5"></div>
+      <div><label for="duration" data-i18n="label.duration"></label><input id="duration" type="number" value="2.0" step="0.5" min="0.5"></div>
       <div><label for="fps">FPS</label><input id="fps" type="number" value="24" readonly></div>
     </div>
     <div class="row3">
@@ -844,39 +923,226 @@ INDEX_HTML = r"""<!doctype html>
       <div><label for="seed">Seed</label>
         <div class="seed">
           <input id="seed" type="number" value="42" min="0" max="2147483647">
-          <button type="button" class="dice" id="dice" title="換一個隨機 seed">🎲</button>
+          <button type="button" class="dice" id="dice" data-i18n-title="dice.title">🎲</button>
         </div>
       </div>
     </div>
-    <label class="toggle"><input id="rand" type="checkbox">每次生成都用新的隨機 seed</label>
+    <label class="toggle"><input id="rand" type="checkbox"><span data-i18n="opt.random"></span></label>
 
-    <button id="go">生成</button>
+    <button id="go" data-i18n="btn.generate"></button>
     <p class="hint" id="est"></p>
   </section>
 
   <section>
     <div class="panel">
-      <div class="status" id="stat">尚未送出請求。</div>
+      <div class="status" id="stat" data-i18n="stat.idle"></div>
       <div id="out"></div>
     </div>
     <div class="panel" style="margin-top:24px">
-      <h2>佇列</h2>
+      <h2 data-i18n="h2.queue"></h2>
       <div id="queue"></div>
     </div>
     <div class="panel" style="margin-top:24px">
-      <h2>歷史紀錄</h2>
+      <h2 data-i18n="h2.history"></h2>
       <div class="hist" id="hist"></div>
     </div>
   </section>
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const fmt = s => s < 90 ? s.toFixed(0) + " 秒"
-  : Math.floor(s / 60) + " 分 " + (s % 60).toFixed(0) + " 秒";
+
+// Two languages, one page. Traditional Chinese browsers land on Chinese and
+// everyone else — including zh-CN — on English; the header link overrides that
+// choice and remembers it, so a shared machine isn't stuck with one locale.
+const STRINGS = {
+  en: {
+    "lang.other": "繁體中文",
+    "hdr.connecting": "connecting…",
+    "hdr.busy": "online · generating",
+    "hdr.idle": "online · idle",
+    "hdr.queue": " · queue {n}",
+    "hdr.offline": "unreachable",
+    "hdr.uierror": "frontend error",
+    "label.mode": "Mode",
+    "opt.structured": "Structured prompt (H3's own format)",
+    "note.description": "Framing, action, camera, dialogue, on-scene sound",
+    "note.soundscape": "Ambience and action sound — what the characters hear",
+    "note.music": "Score only the audience hears; N/A for none",
+    "tips.summary": "Format crib sheet",
+    "tips.list":
+      "<li><b>Shots</b>: open with <code>[Shot 1]</code> and state style and framing; later shots as <code>[Shot 2] At 00:03.500, the camera cuts to…</code> (no timestamp on the first)</li>" +
+      "<li><b>Camera</b>: <code>Push In / Pull Out / Truck Left / Pan Right / Tilt Up / Arc Shot / Tracking Shot / Static Shot / POV</code>, optionally <code>with small amplitude</code> or <code>at slow speed</code></li>" +
+      "<li><b>Dialogue</b>: <code>&lt;d&gt;[English] First batch of the morning.&lt;/d&gt;</code>, speaker tagged <code>(S1)</code></li>" +
+      "<li><b>Style</b>: <code>Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film</code></li>" +
+      "<li><b>FL2VA</b> prefers a single shot so the model interpolates continuously; the alignment line is filled in from the duration</li>",
+    "tips.source": 'Follows the official <a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt" target="_blank" rel="noreferrer">h3-prompt-writing</a> guide.',
+    "att.legend": "Reference input",
+    "att.image": "First frame / reference image",
+    "att.audio": "Reference audio",
+    "att.video": "Reference video (multiple allowed; their own audio is kept)",
+    "label.resolution": "Resolution",
+    "preset.fast": "768 × 448 — verified, fast",
+    "preset.quality": "1344 × 768 — verified, quality",
+    "preset.custom": "Custom",
+    "preset.auto": "Auto — follow the reference image",
+    "label.width": "Width",
+    "label.height": "Height",
+    "label.duration": "Duration (s)",
+    "dice.title": "Draw another random seed",
+    "opt.random": "Draw a fresh seed for every generation",
+    "btn.generate": "Generate",
+    "stat.idle": "Nothing submitted yet.",
+    "h2.queue": "Queue",
+    "h2.history": "History",
+    "rule.t2va": "Text only — no attachments.",
+    "rule.fl2va": "Needs one image as the first frame; no audio or video.",
+    "rule.ref2va": "An image + audio pair, or one or more reference videos (video mode keeps their own audio, so no separate audio).",
+    "fmt.sec": "{n}s",
+    "fmt.min": "{m}m {s}s",
+    "est": "Roughly {t} (extrapolated from a measured run on this box's Cache-DiT profile)",
+    "hist.empty": "Nothing yet.",
+    "hist.attached": "attached: ",
+    "queue.empty": "The queue is empty.",
+    "del.title": "Delete this video and its parameter file",
+    "del.confirm": "Delete {file}?\nThe video and its parameter file go together, and there is no undo.",
+    "del.failed": "Delete failed",
+    "link.download": "Download",
+    "link.delete": "Delete",
+    "state.queued": "queued",
+    "state.running": "running",
+    "state.done": "done",
+    "state.failed": "failed",
+    "state.cancelled": "cancelled",
+    "job.done": "Done in {t} ({mb} MB) · seed {seed}",
+    "job.progress": " · {done} of ~{est}",
+    "job.position": " · #{n} in line",
+    "job.noprompt": "(no prompt)",
+    "btn.cancel": "Cancel",
+    "forget.title": "Remove from the queue list (the video stays)",
+    "forget.all": "Clear all finished ({n})",
+    "need.description": "Fill in integrated_multimodal_description first.",
+    "need.prompt": "Enter a prompt first.",
+    "stat.reading": "Reading attachments…",
+    "stat.sending": "Submitted, queueing…",
+    "stat.queued": "Queued — {n} job(s) ahead of it.",
+    "stat.next": "Queued — starting shortly.",
+    "align.hint": "Prepended automatically: Picture 1 (from Shot 1) → 0.00 s; Picture 2 (from Shot {shot}) → {secs} s"
+  },
+  zh: {
+    "lang.other": "English",
+    "hdr.connecting": "連線中…",
+    "hdr.busy": "服務中 · 生成中",
+    "hdr.idle": "服務中 · 閒置",
+    "hdr.queue": " · 佇列 {n}",
+    "hdr.offline": "無法連線",
+    "hdr.uierror": "前端錯誤",
+    "label.mode": "生成模式",
+    "opt.structured": "結構化 prompt（H3 官方格式）",
+    "note.description": "畫面、動作、運鏡、對白、場景內聲音",
+    "note.soundscape": "環境音與動作聲，角色聽得到的",
+    "note.music": "配樂，只有觀眾聽得到；不要配樂就填 N/A",
+    "tips.summary": "格式速查",
+    "tips.list":
+      "<li><b>鏡頭</b>：<code>[Shot 1]</code> 起頭並註明風格與構圖；後續鏡頭 <code>[Shot 2] At 00:03.500, the camera cuts to…</code>（首個鏡頭不加時間）</li>" +
+      "<li><b>運鏡</b>：<code>Push In / Pull Out / Truck Left / Pan Right / Tilt Up / Arc Shot / Tracking Shot / Static Shot / POV</code>，可加 <code>with small amplitude</code>、<code>at slow speed</code></li>" +
+      "<li><b>對白</b>：<code>&lt;d&gt;[English] First batch of the morning.&lt;/d&gt;</code>，說話者標 <code>(S1)</code></li>" +
+      "<li><b>風格</b>：<code>Cinematic / live-action / 2D-animated / 3D CG / claymation / watercolor / vintage film</code></li>" +
+      "<li><b>FL2VA</b> 偏好單一鏡頭，讓模型連續內插；對齊指令會依秒數自動帶入</li>",
+    "tips.source": '依據官方 <a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt" target="_blank" rel="noreferrer">h3-prompt-writing</a> 指引。',
+    "att.legend": "參考輸入",
+    "att.image": "首格圖片 / 參考圖片",
+    "att.audio": "參考音訊",
+    "att.video": "參考影片（可多選，沿用其原聲）",
+    "label.resolution": "解析度",
+    "preset.fast": "768 × 448 — 已驗證，快速",
+    "preset.quality": "1344 × 768 — 已驗證，品質",
+    "preset.custom": "自訂",
+    "preset.auto": "依參考圖片比例自動",
+    "label.width": "寬",
+    "label.height": "高",
+    "label.duration": "秒數",
+    "dice.title": "換一個隨機 seed",
+    "opt.random": "每次生成都用新的隨機 seed",
+    "btn.generate": "生成",
+    "stat.idle": "尚未送出請求。",
+    "h2.queue": "佇列",
+    "h2.history": "歷史紀錄",
+    "rule.t2va": "純文字生成，不接受任何附件。",
+    "rule.fl2va": "必須提供一張圖片作為第一幀，不接受音訊或影片。",
+    "rule.ref2va": "「圖片＋音訊」成對，或一支以上參考影片（影片模式沿用原聲，不可再附音訊）。",
+    "fmt.sec": "{n} 秒",
+    "fmt.min": "{m} 分 {s} 秒",
+    "est": "預估耗時約 {t}（依本機實測的 Cache-DiT profile 推算）",
+    "hist.empty": "尚無紀錄。",
+    "hist.attached": "附件: ",
+    "queue.empty": "佇列是空的。",
+    "del.title": "刪除這支影片與它的參數檔",
+    "del.confirm": "刪除 {file} ？\n影片與參數檔會一起移除，無法復原。",
+    "del.failed": "刪除失敗",
+    "link.download": "下載",
+    "link.delete": "刪除",
+    "state.queued": "排隊中",
+    "state.running": "生成中",
+    "state.done": "完成",
+    "state.failed": "失敗",
+    "state.cancelled": "已取消",
+    "job.done": "完成，耗時 {t}（{mb} MB）· seed {seed}",
+    "job.progress": " · 已 {done} / 約 {est}",
+    "job.position": " · 第 {n} 順位",
+    "job.noprompt": "(無 prompt)",
+    "btn.cancel": "取消",
+    "forget.title": "從佇列清單移除（不影響影片檔）",
+    "forget.all": "清除全部已完成（{n}）",
+    "need.description": "請先填寫 integrated_multimodal_description。",
+    "need.prompt": "請先輸入 prompt。",
+    "stat.reading": "讀取附件…",
+    "stat.sending": "已送出，排隊中…",
+    "stat.queued": "已加入佇列，前面還有 {n} 個任務。",
+    "stat.next": "已加入佇列，即將開始。",
+    "align.hint": "會自動加在最前面：Picture 1 (from Shot 1) → 0.00 秒；Picture 2 (from Shot {shot}) → {secs} 秒"
+  }
+};
+
+const detectLang = () =>
+  (navigator.languages && navigator.languages.length
+    ? navigator.languages : [navigator.language || "en"])
+    .some(l => /^zh[-_](hant|tw|hk|mo)/i.test(l)) ? "zh" : "en";
+
+let LANG = localStorage.getItem("h3-lang");
+if (LANG !== "en" && LANG !== "zh") LANG = detectLang();
+
+const tr = (key, vars) => (STRINGS[LANG][key] ?? STRINGS.en[key] ?? key)
+  .replace(/\{(\w+)\}/g, (m, name) =>
+    vars && name in vars ? vars[name] : m);
+
+// The server localises its own errors and task labels, so it needs to know
+// which way the page went — Accept-Language alone would ignore the toggle.
+const api = (path, opts = {}) => fetch(path, {
+  ...opts, headers: {...(opts.headers || {}), "X-Lang": LANG}
+});
+
+function applyI18n() {
+  document.documentElement.lang = LANG === "zh" ? "zh-Hant" : "en";
+  const set = (attr, apply) =>
+    document.querySelectorAll("[" + attr + "]").forEach(
+      el => apply(el, tr(el.getAttribute(attr))));
+  set("data-i18n", (el, v) => el.textContent = v);
+  set("data-i18n-html", (el, v) => el.innerHTML = v);
+  set("data-i18n-title", (el, v) => el.title = v);
+}
+applyI18n();
+
+$("lang").onclick = e => {
+  e.preventDefault();
+  localStorage.setItem("h3-lang", LANG === "zh" ? "en" : "zh");
+  location.reload();
+};
+
+const fmt = s => s < 90
+  ? tr("fmt.sec", {n: s.toFixed(0)})
+  : tr("fmt.min", {m: Math.floor(s / 60), s: (s % 60).toFixed(0)});
 const RULES = {
-  t2va: "純文字生成，不接受任何附件。",
-  fl2va: "必須提供一張圖片作為第一幀，不接受音訊或影片。",
-  ref2va: "「圖片＋音訊」成對，或一支以上參考影片（影片模式沿用原聲，不可再附音訊）。"
+  t2va: "rule.t2va", fl2va: "rule.fl2va", ref2va: "rule.ref2va"
 };
 let TASKS = ["t2va"];
 
@@ -890,8 +1156,8 @@ function dims() {
 function estimate() {
   const [w, h] = dims();
   const cost = (w || 1344) * (h || 768) * (+$("steps").value) * (+$("duration").value);
-  $("est").textContent = "預估耗時約 " + fmt(84 * cost / (768 * 448 * 20 * 2.0)) +
-    "（依本機實測的 Cache-DiT profile 推算）";
+  $("est").textContent = tr("est",
+    {t: fmt(84 * cost / (768 * 448 * 20 * 2.0))});
 }
 function syncTask() {
   const t = $("task").value;
@@ -899,7 +1165,7 @@ function syncTask() {
   $("att-image").style.display = (t === "fl2va" || t === "ref2va") ? "block" : "none";
   $("att-audio").style.display = t === "ref2va" ? "block" : "none";
   $("att-video").style.display = t === "ref2va" ? "block" : "none";
-  $("att-rule").textContent = RULES[t] || "";
+  $("att-rule").textContent = RULES[t] ? tr(RULES[t]) : "";
   estimate();
   syncAlignHint();
 }
@@ -930,7 +1196,7 @@ const toDataUrl = file => new Promise((res, rej) => {
 
 async function poll() {
   try {
-    const s = await (await fetch("/api/status")).json();
+    const s = await (await api("/api/status")).json();
     $("part").textContent = "partition: " + s.partition;
     if (JSON.stringify(s.tasks) !== JSON.stringify(TASKS)) {
       TASKS = s.tasks;
@@ -940,41 +1206,44 @@ async function poll() {
     }
     if (s.online) {
       $("svc").className = "pill ok";
-      $("svc").textContent = (s.busy ? "服務中 · 生成中" : "服務中 · 閒置") +
-        (s.waiting ? " · 佇列 " + s.waiting : "");
+      $("svc").textContent = tr(s.busy ? "hdr.busy" : "hdr.idle") +
+        (s.waiting ? tr("hdr.queue", {n: s.waiting}) : "");
       $("prof").textContent = s.attention + " / " + s.execution + " / cache: " + s.profile;
     } else {
       $("svc").className = "pill bad";
-      $("svc").textContent = "無法連線";
+      $("svc").textContent = tr("hdr.offline");
       $("prof").textContent = s.detail || "";
     }
-  } catch (e) { $("svc").className = "pill bad"; $("svc").textContent = "前端錯誤"; }
+  } catch (e) {
+    $("svc").className = "pill bad"; $("svc").textContent = tr("hdr.uierror");
+  }
 }
 poll(); setInterval(poll, 5000);
 
 async function loadHistory() {
-  const items = await (await fetch("/api/history")).json();
+  const items = await (await api("/api/history")).json();
   $("hist").innerHTML = items.map(i => `
     <div class="card">
-      <button class="del" title="刪除這支影片與它的參數檔"
+      <button class="del" title="${tr("del.title")}"
         onclick="delMedia('${i.file}')">✕</button>
       <video src="/media/${i.file}" muted preload="metadata"
         onclick="show('${i.file}')"></video>
       <div onclick="show('${i.file}')">${i.task || "t2va"} ·
         ${i.width || "auto"}×${i.height || "auto"} ·
         ${i.steps} steps · seed ${i.seed}<br>${fmt(i.elapsed)}${
-        (i.attached || []).length ? " · 附件: " + i.attached.join(",") : ""}</div>
-    </div>`).join("") || '<p class="hint">尚無紀錄。</p>';
+        (i.attached || []).length
+          ? " · " + tr("hist.attached") + i.attached.join(",") : ""}</div>
+    </div>`).join("") || `<p class="hint">${tr("hist.empty")}</p>`;
 }
 
 // Deletion unlinks the file — there is no trash to recover it from, so the
 // confirm carries the filename rather than a generic "are you sure".
 let shownFile = null;
 async function delMedia(file) {
-  if (!confirm("刪除 " + file + " ？\n影片與參數檔會一起移除，無法復原。")) return;
-  const r = await fetch("/api/history/" + encodeURIComponent(file), {method: "DELETE"});
+  if (!confirm(tr("del.confirm", {file}))) return;
+  const r = await api("/api/history/" + encodeURIComponent(file), {method: "DELETE"});
   if (!r.ok) {
-    const {error} = await r.json().catch(() => ({error: "刪除失敗"}));
+    const {error} = await r.json().catch(() => ({error: tr("del.failed")}));
     $("stat").className = "status err"; $("stat").textContent = error;
     return;
   }
@@ -986,16 +1255,17 @@ loadHistory();
 function show(file) {
   shownFile = file;
   $("out").innerHTML = `<video src="/media/${file}" controls autoplay></video>
-    <p class="meta">${file} · <a href="/media/${file}" download>下載</a> ·
-      <a href="#" onclick="delMedia('${file}');return false">刪除</a></p>`;
+    <p class="meta">${file} · <a href="/media/${file}" download>${tr("link.download")}</a> ·
+      <a href="#" onclick="delMedia('${file}');return false">${tr("link.delete")}</a></p>`;
 }
 
 const esc = s => (s || "").replace(/[&<>"]/g, c =>
   ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
 
 const STATE_TAG = {
-  queued: ["", "排隊中"], running: ["run", "生成中"],
-  done: ["", "完成"], failed: ["bad", "失敗"], cancelled: ["", "已取消"]
+  queued: ["", "state.queued"], running: ["run", "state.running"],
+  done: ["", "state.done"], failed: ["bad", "state.failed"],
+  cancelled: ["", "state.cancelled"]
 };
 
 // null until the first poll: without it, every job already finished before the
@@ -1004,7 +1274,7 @@ let seenDone = null;
 
 async function loadQueue() {
   let jobs;
-  try { jobs = await (await fetch("/api/jobs")).json(); } catch (e) { return; }
+  try { jobs = await (await api("/api/jobs")).json(); } catch (e) { return; }
 
   const done = jobs.filter(j => j.state === "done");
   if (seenDone === null) {
@@ -1015,8 +1285,9 @@ async function loadQueue() {
     if (fresh.length) {
       const j = fresh[0];   // newest first from the server
       $("stat").className = "status";
-      $("stat").textContent = "完成，耗時 " + fmt(j.elapsed) +
-        "（" + (j.size / 1048576).toFixed(2) + " MB）· seed " + j.params.seed;
+      $("stat").textContent = tr("job.done", {
+        t: fmt(j.elapsed), mb: (j.size / 1048576).toFixed(2),
+        seed: j.params.seed});
       show(j.file);
       loadHistory();
     }
@@ -1026,11 +1297,14 @@ async function loadQueue() {
   const shown = pending.length ? pending
     : jobs.slice(0, 3);   // nothing waiting: keep the last few for context
   $("queue").innerHTML = shown.map(j => {
-    const [cls, text] = STATE_TAG[j.state] || ["", j.state];
+    const [cls, key] = STATE_TAG[j.state] || ["", null];
+    const text = key ? tr(key) : j.state;
     const p = j.params || {};
     let sub = `${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`;
-    if (j.state === "running") sub += ` · 已 ${fmt(j.elapsed || 0)} / 約 ${fmt(j.estimate || 0)}`;
-    else if (j.state === "queued") sub += ` · 第 ${j.position} 順位`;
+    if (j.state === "running")
+      sub += tr("job.progress",
+                {done: fmt(j.elapsed || 0), est: fmt(j.estimate || 0)});
+    else if (j.state === "queued") sub += tr("job.position", {n: j.position});
     else if (j.state === "done") sub += ` · ${fmt(j.elapsed || 0)}`;
     else if (j.state === "failed") sub = esc((j.error || "").split("\n")[0]).slice(0, 120);
     const done = j.state === "done";
@@ -1039,38 +1313,40 @@ async function loadQueue() {
         done ? ` onclick="show('${j.file}')"` : ""}>
       <span class="tag ${cls}">${text}</span>
       <span class="txt">
-        <span class="line">${esc(p.description || p.prompt) || "(無 prompt)"}</span>
+        <span class="line">${esc(p.description || p.prompt) || tr("job.noprompt")}</span>
         <span class="line sub">${sub}</span></span>
       ${j.state === "queued"
-        ? `<button class="x" onclick="event.stopPropagation();cancelJob('${j.id}')">取消</button>`
+        ? `<button class="x" onclick="event.stopPropagation();cancelJob('${j.id}')">${
+             tr("btn.cancel")}</button>`
         : ""}
       ${final
-        ? `<button class="x" title="從佇列清單移除（不影響影片檔）"
+        ? `<button class="x" title="${tr("forget.title")}"
              onclick="event.stopPropagation();forgetJob('${j.id}')">✕</button>`
         : ""}
     </div>`;
-  }).join("") || '<p class="hint">佇列是空的。</p>';
+  }).join("") || `<p class="hint">${tr("queue.empty")}</p>`;
   const finished = jobs.filter(j => ["done","failed","cancelled"].includes(j.state));
   if (finished.length > 1) {
     $("queue").innerHTML += `<p class="hint" style="margin-top:12px">
-      <a href="#" onclick="forgetFinished();return false">清除全部已完成（${finished.length}）</a></p>`;
+      <a href="#" onclick="forgetFinished();return false">${
+        tr("forget.all", {n: finished.length})}</a></p>`;
   }
 }
 
 // Forgetting only drops the queue entry. The video stays on disk and in the
 // history, where deleting is a separate, louder action.
 async function forgetJob(id) {
-  await fetch("/api/job/" + id, {method: "DELETE"});
+  await api("/api/job/" + id, {method: "DELETE"});
   loadQueue();
 }
 
 async function forgetFinished() {
-  await fetch("/api/jobs/finished", {method: "DELETE"});
+  await api("/api/jobs/finished", {method: "DELETE"});
   loadQueue();
 }
 
 async function cancelJob(id) {
-  const r = await fetch("/api/job/" + id + "/cancel", {method: "POST"});
+  const r = await api("/api/job/" + id + "/cancel", {method: "POST"});
   if (!r.ok) {
     const {error} = await r.json();
     $("stat").className = "status err"; $("stat").textContent = error;
@@ -1102,8 +1378,7 @@ function syncAlignHint() {
   const shots = ($("description").value.match(/\[Shot (\d+)\]/g) || []);
   const last = shots.length ? shots[shots.length - 1].match(/\d+/)[0] : "1";
   el.style.display = "block";
-  el.textContent = "會自動加在最前面：Picture 1 (from Shot 1) → 0.00 秒；" +
-    "Picture 2 (from Shot " + last + ") → " + secs + " 秒";
+  el.textContent = tr("align.hint", {shot: last, secs});
 }
 
 $("structured").onchange = syncStructured;
@@ -1126,15 +1401,13 @@ $("go").onclick = async () => {
     : {prompt: $("prompt").value.trim()};
   if (structured ? !text.description : !text.prompt) {
     $("stat").className = "status";
-    $("stat").textContent = structured
-      ? "請先填寫 integrated_multimodal_description。"
-      : "請先輸入 prompt。";
+    $("stat").textContent = tr(structured ? "need.description" : "need.prompt");
     return;
   }
   const [width, height] = dims();
   $("go").disabled = true;
   $("stat").className = "status";
-  $("stat").textContent = "讀取附件…";
+  $("stat").textContent = tr("stat.reading");
 
   const attachments = {};
   if ($("f-image").files[0] && $("att-image").style.display !== "none")
@@ -1146,8 +1419,8 @@ $("go").onclick = async () => {
 
   if ($("rand").checked) rollSeed();
 
-  $("stat").textContent = "已送出，排隊中…";
-  const res = await fetch("/api/generate", {
+  $("stat").textContent = tr("stat.sending");
+  const res = await api("/api/generate", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
       task: $("task").value, ...text, width, height,
@@ -1164,8 +1437,8 @@ $("go").onclick = async () => {
   }
   $("stat").className = "status";
   $("stat").textContent = position > 1
-    ? "已加入佇列，前面還有 " + (position - 1) + " 個任務。"
-    : "已加入佇列，即將開始。";
+    ? tr("stat.queued", {n: position - 1})
+    : tr("stat.next");
   loadQueue();
 };
 </script>
