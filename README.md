@@ -6,6 +6,8 @@ A thin browser frontend for video generation on a [vLLM-Omni](https://github.com
 
 One file, standard library only, no build step. Point it at a running server and open a browser.
 
+![The h3-ui interface in English](docs/ui-en.png)
+
 It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bodies, base64 attachments, an API key you don't want in your shell history, and generations long enough that a dropped connection loses the result. This sits in front of that and keeps the key server-side.
 
 ## What it does
@@ -58,6 +60,8 @@ by hand, and the choice is remembered in that browser's `localStorage`.
 Server-side error messages follow the same choice: the page sends `X-Lang` with every
 API call and the server falls back to `Accept-Language` when it is absent, so `curl`
 gets messages in its own locale too.
+
+The Chinese page looks like [this](docs/ui-zh.png).
 
 ## Security
 
@@ -167,6 +171,7 @@ Other things it deliberately doesn't do: no user accounts, no multi-GPU scheduli
 ```
 server.py       everything: HTTP handler, queue worker, and the page itself
 .env.example    configuration template
+docs/           interface screenshots
 media/          generated videos and their sidecar JSON (gitignored)
 ```
 

@@ -6,6 +6,8 @@
 
 單一檔案、只用標準函式庫、不需編譯。指向一台執行中的伺服器，然後打開瀏覽器就能用。
 
+![h3-ui 的繁體中文介面](docs/ui-zh.png)
+
 它存在的理由是：手動對 `/v1/videos/sync` 送請求很煩——multipart 的 body、base64 的附件、一把你不想留在 shell 歷史裡的 API key，以及長到連線一斷就前功盡棄的生成時間。這支程式擋在前面，並把金鑰留在伺服器端。
 
 ## 它能做什麼
@@ -53,6 +55,8 @@ python3 server.py
 介面有英文與繁體中文兩種，依瀏覽器語言自動選擇：**繁體中文語系（`zh-TW` / `zh-Hant` / `zh-HK` / `zh-MO`）看到中文版，其餘語系（包含 `zh-CN`）看到英文版。** 標頭右上角的連結可以手動切換，選擇會記在該瀏覽器的 `localStorage` 裡。
 
 伺服器回傳的錯誤訊息也跟著同一套語言：頁面會在每個 API 請求帶上 `X-Lang`，沒有這個標頭時則回頭看 `Accept-Language`，所以用 `curl` 直接呼叫也會拿到符合你語系的訊息。
+
+英文版介面長[這樣](docs/ui-en.png)。
 
 ## 安全性
 
@@ -161,6 +165,7 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d 
 ```
 server.py       全部：HTTP handler、佇列 worker，以及頁面本身
 .env.example    設定範本
+docs/           介面截圖
 media/          生成的影片與它們的參數 JSON（已 gitignore）
 ```
 
