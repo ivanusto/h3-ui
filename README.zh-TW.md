@@ -26,6 +26,23 @@
 - Python 3.10+，只用標準函式庫，不必安裝任何東西
 - 一台跑著影片模型、連得到的 vLLM-Omni 伺服器
 
+## 伺服器相容性
+
+h3-ui 講的是 2026-08-02 發布的 `minimax-h3` image 當時的 vLLM-Omni 影片契約：畫布由
+`width` 與 `height` 決定，時長沒有下限。
+
+較新的 vLLM-Omni 改了 MiniMax H3 的請求規則。以下是在 GB10 上對 2026-08-22 的 nightly
+實測到的：
+
+- 輸出時長必須介於 4 到 15 秒。送 2 秒會拿到
+  `500 MiniMax H3 output duration must be in [4, 15] seconds`。
+- `t2va` 必須明確指定 `aspect_ratio`，限 `21:9`、`16:9`、`4:3`、`1:1`、`3:4`、`9:16`
+  其中之一。改送 `width` 與 `height` 會拿到 `500 t2va requires an explicit aspect_ratio`，
+  而 `adaptive` 與 `auto` 對 `t2va` 會被拒。`fl2va` 兩種情況下都是跟隨輸入圖。
+
+所以對著較新的伺服器，解析度欄位與任何低於 4 秒的時長都會失敗。在表單學會兩種契約之前，
+請把 h3-ui 指向用舊 image 建的伺服器，或者從工作的錯誤欄位讀原因。
+
 ## 安裝設定
 
 ```sh

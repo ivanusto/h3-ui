@@ -26,6 +26,26 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 - Python 3.10+, standard library only, nothing to install
 - A reachable vLLM-Omni server serving a video model
 
+## Server compatibility
+
+h3-ui speaks the vLLM-Omni video contract as it stood in the `minimax-h3` image
+published on 2026-08-02: the canvas comes from `width` and `height`, and nothing
+bounds the duration from below.
+
+Newer vLLM-Omni builds changed MiniMax H3's request rules. Measured against the
+2026-08-22 nightly on a GB10:
+
+- Output duration has to be between 4 and 15 seconds. A 2 second request comes
+  back as `500 MiniMax H3 output duration must be in [4, 15] seconds`.
+- `t2va` needs an explicit named `aspect_ratio`, one of `21:9`, `16:9`, `4:3`,
+  `1:1`, `3:4`, `9:16`. Sending `width` and `height` instead returns
+  `500 t2va requires an explicit aspect_ratio`, and `adaptive` or `auto` are
+  refused for `t2va`. `fl2va` takes its ratio from the input image either way.
+
+So the resolution box and any duration under 4 seconds will fail against a
+recent server. Point h3-ui at a server built from the older image until the form
+speaks both contracts, or read the reason in the job's error field.
+
 ## Setup
 
 ```sh
