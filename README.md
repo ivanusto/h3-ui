@@ -44,11 +44,31 @@ Resolved in order: process environment → `.env` → default.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL (a trailing `/v1` is stripped) |
+| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL, or several separated by commas (a trailing `/v1` is stripped) |
 | `H3_API_KEY` | *(empty)* | Sent as `Authorization: Bearer` when set |
 | `H3_UI_HOST` | `127.0.0.1` | UI bind address |
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
+
+## More than one box
+
+`H3_API_BASE` accepts a comma separated list, so several machines can each run
+their own vLLM-Omni behind one queue:
+
+```
+H3_API_BASE=http://192.168.2.131:8002,http://192.168.2.141:8002
+```
+
+Each upstream gets its own worker, all drawing from the same FIFO, so whichever
+box frees up first takes the next job and submission order is still the order
+work starts. Results come back over HTTP and are written where the UI runs, so
+the gallery stays in one place. A box that stops answering is left out of the
+rotation until it returns rather than being handed jobs to fail, and the header
+says how many boxes are busy and whether any are unreachable.
+
+This does not make one render faster. A model cannot span machines here: the
+diffusion executor spawns local processes only, so there is no cross-machine
+tensor or sequence parallelism. What you get is one job per box at a time.
 
 ## Language
 

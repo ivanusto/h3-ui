@@ -152,9 +152,21 @@ def setting(key, default):
 UI_HOST = setting("H3_UI_HOST", "127.0.0.1")
 UI_PORT = int(setting("H3_UI_PORT", "8080"))
 
-API_BASE = setting("H3_API_BASE", "http://127.0.0.1:8000").rstrip("/")
-if API_BASE.endswith("/v1"):
-    API_BASE = API_BASE[: -len("/v1")]
+def normalise_base(value):
+    """One upstream URL, without a trailing slash or /v1."""
+    base = value.strip().rstrip("/")
+    return base[: -len("/v1")] if base.endswith("/v1") else base
+
+
+# H3_API_BASE takes a comma separated list, so two GB10 boxes can each serve
+# their own vLLM-Omni. A model cannot span them: the diffusion executor only
+# ever spawns local processes, so there is no cross-machine tensor or sequence
+# parallelism to be had. The win is one job per box at a time, not one job
+# finishing twice as fast.
+API_BASES = [normalise_base(part)
+             for part in setting("H3_API_BASE", "http://127.0.0.1:8000").split(",")
+             if part.strip()]
+API_BASE = API_BASES[0]
 API_KEY = ENV.get("H3_API_KEY", "")
 
 
@@ -174,10 +186,11 @@ PARTITION = load_partition()
 JOBS = {}
 JOBS_LOCK = threading.Lock()
 
-# One worker draining a FIFO queue, rather than a thread per job contending on
-# a lock: threading.Lock has no ordering guarantee, so queued work used to
-# start in an arbitrary order. The GPU serialises the real work regardless —
-# this makes the order you submitted the order you get.
+# One worker per upstream draining a shared FIFO, rather than a thread per job
+# contending on a lock: threading.Lock has no ordering guarantee, so queued
+# work used to start in an arbitrary order. Each GPU serialises its own work,
+# so this makes the order you submitted the order work starts, across however
+# many boxes are configured.
 JOB_QUEUE = queue.Queue()
 
 # Finished jobs stay listed so the queue view keeps its history across a page
@@ -263,20 +276,24 @@ def build_request(params, attachments, lang="en"):
     return fields, files
 
 
-def run_job(job_id, params, attachments, lang="en"):
-    """Run one generation to completion. Called only by the queue worker.
+def run_job(job_id, params, attachments, lang="en", api_base=None):
+    """Run one generation to completion. Called only by a queue worker.
 
     `lang` is the submitting page's language: a job can fail long after the
     request that queued it, so the language travels with the job rather than
     being read off whichever request happens to collect the error.
+
+    `api_base` is the upstream this worker owns. It is recorded on the job so
+    the queue view can say which box a render is on.
     """
+    api_base = api_base or API_BASE
     def touch(**kw):
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id].update(kw)
 
     started = time.time()
-    touch(state="running", started=started)
+    touch(state="running", started=started, backend=api_base)
     try:
         fields, files = build_request(params, attachments, lang)
     except ValueError as exc:
@@ -284,7 +301,7 @@ def run_job(job_id, params, attachments, lang="en"):
         return
     body, content_type = encode_multipart(fields, files)
     request = urllib.request.Request(
-        f"{API_BASE}/v1/videos/sync", data=body,
+        f"{api_base}/v1/videos/sync", data=body,
         headers={"Content-Type": content_type, **auth_headers()},
         method="POST")
     try:
@@ -318,16 +335,33 @@ def run_job(job_id, params, attachments, lang="en"):
     touch(state="done", elapsed=elapsed, file=name, size=len(payload))
 
 
-def worker_loop():
-    """Drain the queue forever, one job at a time, in submission order."""
+def worker_loop(api_base):
+    """Drain the shared queue forever, one job at a time on this upstream.
+
+    One worker per upstream, all pulling from the same FIFO: whichever box
+    frees up first takes the next job, and submission order is still the order
+    work starts.
+    """
     while True:
-        job_id, params, attachments, lang = JOB_QUEUE.get()
+        # Do not draw work while this box is unreachable. Leaving the job in
+        # the queue lets a healthy box take it, and if every box is down the
+        # work waits rather than failing one request at a time.
+        with STATUS_LOCK:
+            usable = STATUS_CACHE[api_base]["online"] is True
+        if not usable:
+            time.sleep(PROBE_INTERVAL)
+            continue
+        try:
+            job_id, params, attachments, lang = JOB_QUEUE.get(
+                timeout=PROBE_INTERVAL)
+        except queue.Empty:
+            continue          # recheck this box's health, then wait again
         try:
             with JOBS_LOCK:
                 job = JOBS.get(job_id)
                 skip = job is None or job.get("state") == "cancelled"
             if not skip:
-                run_job(job_id, params, attachments, lang)
+                run_job(job_id, params, attachments, lang, api_base)
         except Exception as exc:  # noqa: BLE001 - a bad job must not end the worker
             with JOBS_LOCK:
                 if job_id in JOBS:
@@ -495,13 +529,14 @@ PROBE_TIMEOUT = 5
 PROBE_FAILURES_BEFORE_OFFLINE = 3
 
 STATUS_LOCK = threading.Lock()
-STATUS_CACHE = {"online": None, "model": None, "detail": None,
-                "checked": 0.0, "failures": 0}
+STATUS_CACHE = {base: {"online": None, "model": None, "detail": None,
+                       "checked": 0.0, "failures": 0}
+                for base in API_BASES}
 
 
-def probe_upstream():
+def probe_upstream(api_base):
     """One /v1/models call. Returns (ok, model_id or None, detail or None)."""
-    request = urllib.request.Request(f"{API_BASE}/v1/models", headers=auth_headers())
+    request = urllib.request.Request(f"{api_base}/v1/models", headers=auth_headers())
     try:
         with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
             data = json.load(response)
@@ -510,46 +545,65 @@ def probe_upstream():
         return False, None, f"{type(exc).__name__}: {exc}"
 
 
-def status_prober_loop():
-    """Keep the cached upstream status fresh, off the request path."""
+def status_prober_loop(api_base):
+    """Keep one upstream's cached status fresh, off the request path."""
+    entry = STATUS_CACHE[api_base]
     while True:
-        ok, model, detail = probe_upstream()
+        ok, model, detail = probe_upstream(api_base)
         with STATUS_LOCK:
-            STATUS_CACHE["checked"] = time.time()
+            entry["checked"] = time.time()
             if ok:
-                STATUS_CACHE.update(online=True, model=model, detail=None,
-                                    failures=0)
+                entry.update(online=True, model=model, detail=None, failures=0)
             else:
-                STATUS_CACHE["detail"] = detail
-                STATUS_CACHE["failures"] += 1
-                if STATUS_CACHE["failures"] >= PROBE_FAILURES_BEFORE_OFFLINE:
-                    STATUS_CACHE["online"] = False
+                entry["detail"] = detail
+                entry["failures"] += 1
+                if entry["failures"] >= PROBE_FAILURES_BEFORE_OFFLINE:
+                    entry["online"] = False
         time.sleep(PROBE_INTERVAL)
+
+
+def backend_view(api_base, busy_bases):
+    """One upstream as the queue view sees it."""
+    with STATUS_LOCK:
+        snapshot = dict(STATUS_CACHE[api_base])
+    state = ("starting" if snapshot["online"] is None
+             else "online" if snapshot["online"] else "offline")
+    return {"base": api_base, "state": state,
+            "busy": api_base in busy_bases,
+            # A probe or two can be swallowed by a busy upstream. Say so
+            # rather than presenting the reading as current.
+            "stale": state == "online" and snapshot["failures"] > 0,
+            "probe_age": (round(time.time() - snapshot["checked"], 1)
+                          if snapshot["checked"] else None),
+            "model": snapshot["model"],
+            "detail": snapshot["detail"] or ""}
 
 
 def service_status(lang="en"):
     """Answer from the cache. This function never touches the network."""
-    base = {"api_base": API_BASE, "partition": PARTITION["partition"],
+    base = {"api_bases": API_BASES, "partition": PARTITION["partition"],
             "tasks": PARTITION["tasks"],
             "labels": TASK_LABELS.get(lang, TASK_LABELS["en"])}
-    with STATUS_LOCK:
-        snapshot = dict(STATUS_CACHE)
     with JOBS_LOCK:
-        busy = any(j.get("state") == "running" for j in JOBS.values())
+        busy_bases = {j.get("backend") for j in JOBS.values()
+                      if j.get("state") == "running"}
         waiting = sum(1 for j in JOBS.values() if j.get("state") == "queued")
+    backends = [backend_view(api_base, busy_bases) for api_base in API_BASES]
+    live = [b for b in backends if b["state"] == "online"]
 
-    if snapshot["online"] is None:
-        # No probe has come back yet: still starting, not unreachable.
-        return {**base, "online": False, "starting": True,
-                "detail": snapshot["detail"] or ""}
-    if not snapshot["online"]:
-        return {**base, "online": False, "detail": snapshot["detail"] or ""}
-    return {**base, "online": True, "busy": busy, "waiting": waiting,
-            # A probe or two can be swallowed by a busy upstream. Say so
-            # rather than presenting the reading as current.
-            "stale": snapshot["failures"] > 0,
-            "probe_age": round(time.time() - snapshot["checked"], 1),
-            "model": snapshot["model"],
+    common = {**base, "backends": backends, "waiting": waiting,
+              "backend_count": len(backends),
+              "busy_count": sum(1 for b in backends if b["busy"]),
+              "offline_count": sum(1 for b in backends if b["state"] == "offline")}
+    if not live:
+        # Starting beats unreachable while any upstream is still unproven.
+        starting = any(b["state"] == "starting" for b in backends)
+        return {**common, "online": False, "starting": starting or None,
+                "detail": next((b["detail"] for b in backends if b["detail"]), "")}
+    return {**common, "online": True,
+            "busy": bool(busy_bases),
+            "stale": any(b["stale"] for b in live),
+            "model": live[0]["model"],
             "profile": ENV.get("H3_CACHE_BACKEND", "none"),
             "attention": ENV.get("H3_DIFFUSION_ATTENTION_BACKEND", ""),
             "execution": ENV.get("H3_EXECUTION_MODE", "")}
@@ -1066,6 +1120,8 @@ const STRINGS = {
     "hdr.queue": " · queue {n}",
     "hdr.offline": "unreachable",
     "hdr.stale": " · reading is a moment old",
+    "hdr.nodes": " · {busy}/{total} boxes busy",
+    "hdr.nodeoff": " · {n} unreachable",
     "hdr.uierror": "frontend error",
     "label.mode": "Mode",
     "opt.structured": "Structured prompt (H3's own format)",
@@ -1140,6 +1196,8 @@ const STRINGS = {
     "hdr.queue": " · 佇列 {n}",
     "hdr.offline": "無法連線",
     "hdr.stale": " · 讀數稍舊",
+    "hdr.nodes": " · {busy}/{total} 台忙碌",
+    "hdr.nodeoff": " · {n} 台連不上",
     "hdr.uierror": "前端錯誤",
     "label.mode": "生成模式",
     "opt.structured": "結構化 prompt（H3 官方格式）",
@@ -1310,9 +1368,15 @@ async function poll() {
       syncTask();
     }
     if (s.online) {
+      // With more than one box the header has to say how many are working,
+      // and call out any that dropped out rather than hiding it behind an
+      // aggregate "online".
+      const many = (s.backend_count || 1) > 1;
       $("svc").className = "pill ok";
       $("svc").textContent = tr(s.busy ? "hdr.busy" : "hdr.idle") +
         (s.waiting ? tr("hdr.queue", {n: s.waiting}) : "") +
+        (many ? tr("hdr.nodes", {busy: s.busy_count, total: s.backend_count}) : "") +
+        (s.offline_count ? tr("hdr.nodeoff", {n: s.offline_count}) : "") +
         (s.stale ? tr("hdr.stale") : "");
       $("prof").textContent = s.attention + " / " + s.execution + " / cache: " + s.profile;
     } else if (s.starting) {
@@ -1560,10 +1624,12 @@ $("go").onclick = async () => {
 
 if __name__ == "__main__":
     MEDIA.mkdir(exist_ok=True)
-    threading.Thread(target=worker_loop, daemon=True, name="JobQueue").start()
-    threading.Thread(target=status_prober_loop, daemon=True,
-                     name="StatusProbe").start()
+    for index, upstream in enumerate(API_BASES):
+        threading.Thread(target=worker_loop, args=(upstream,), daemon=True,
+                         name=f"JobQueue-{index}").start()
+        threading.Thread(target=status_prober_loop, args=(upstream,),
+                         daemon=True, name=f"StatusProbe-{index}").start()
     print(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
-    print(f"upstream: {API_BASE}  auth: {'on' if API_KEY else 'off'}")
+    print(f"upstream: {', '.join(API_BASES)}  auth: {'on' if API_KEY else 'off'}")
     print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}")
     ThreadingHTTPServer((UI_HOST, UI_PORT), Handler).serve_forever()
