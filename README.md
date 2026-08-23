@@ -57,7 +57,7 @@ Set `H3_API_BASES` to a comma separated list, so several machines can each run
 their own vLLM-Omni behind one queue:
 
 ```
-H3_API_BASES=http://192.168.2.131:8002,http://192.168.2.141:8002
+H3_API_BASES=http://spark-a.lan:8002,http://spark-b.lan:8002
 ```
 
 A comma separated `H3_API_BASE` works too, but prefer the plural when the file

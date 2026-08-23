@@ -56,7 +56,7 @@ python3 server.py
 把 `H3_API_BASES` 設成逗號分隔的清單，讓多台機器各自跑自己的 vLLM-Omni，共用同一條佇列：
 
 ```
-H3_API_BASES=http://192.168.2.131:8002,http://192.168.2.141:8002
+H3_API_BASES=http://spark-a.lan:8002,http://spark-b.lan:8002
 ```
 
 `H3_API_BASE` 用逗號分隔也可以，但這個檔案若與部署 repo 共用，請用複數的那個：
