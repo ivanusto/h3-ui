@@ -10,6 +10,8 @@
 
 它存在的理由是：手動對 `/v1/videos/sync` 送請求很煩——multipart 的 body、base64 的附件、一把你不想留在 shell 歷史裡的 API key，以及長到連線一斷就前功盡棄的生成時間。這支程式擋在前面，並把金鑰留在伺服器端。
 
+![The h3-ui interface in English](docs/h3_ui.png)
+
 ## 它能做什麼
 
 - **文字、首格圖片、參考條件三種條件模式** — 任務清單直接讀自載入中的 checkpoint，所以 UI 會對齊實際載入的 partition，不會給出伺服器根本會拒絕的選項。
