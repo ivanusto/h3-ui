@@ -10,6 +10,8 @@ One file, standard library only, no build step. Point it at a running server and
 
 It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bodies, base64 attachments, an API key you don't want in your shell history, and generations long enough that a dropped connection loses the result. This sits in front of that and keeps the key server-side.
 
+![The h3-ui interface in English](docs/h3-ui.png)
+
 ## What it does
 
 - **Text, first-frame, and reference conditioning** — the task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
