@@ -481,21 +481,75 @@ def estimate_seconds(params):
     return round(REF_SECONDS * cost / REF_COST)
 
 
-def service_status(lang="en"):
+# The upstream probe runs on its own thread, never inside a request. A
+# synchronous generation blocks vLLM-Omni's event loop for as long as the MP4
+# takes to encode: measured here at 0.37 s for 768x448/2 s, 2.14 s for
+# 1344x768/2 s and 11.65 s for 1344x768/4 s. Probing from the request path
+# turned that into "unreachable" in the header, so a finished render looked
+# like a dead server until the file landed.
+PROBE_INTERVAL = 5.0
+PROBE_TIMEOUT = 5
+
+# One missed probe means the upstream is busy, not gone. Only a run of them
+# says the service has actually died.
+PROBE_FAILURES_BEFORE_OFFLINE = 3
+
+STATUS_LOCK = threading.Lock()
+STATUS_CACHE = {"online": None, "model": None, "detail": None,
+                "checked": 0.0, "failures": 0}
+
+
+def probe_upstream():
+    """One /v1/models call. Returns (ok, model_id or None, detail or None)."""
     request = urllib.request.Request(f"{API_BASE}/v1/models", headers=auth_headers())
+    try:
+        with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+            data = json.load(response)
+        return True, data["data"][0]["id"], None
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
+        return False, None, f"{type(exc).__name__}: {exc}"
+
+
+def status_prober_loop():
+    """Keep the cached upstream status fresh, off the request path."""
+    while True:
+        ok, model, detail = probe_upstream()
+        with STATUS_LOCK:
+            STATUS_CACHE["checked"] = time.time()
+            if ok:
+                STATUS_CACHE.update(online=True, model=model, detail=None,
+                                    failures=0)
+            else:
+                STATUS_CACHE["detail"] = detail
+                STATUS_CACHE["failures"] += 1
+                if STATUS_CACHE["failures"] >= PROBE_FAILURES_BEFORE_OFFLINE:
+                    STATUS_CACHE["online"] = False
+        time.sleep(PROBE_INTERVAL)
+
+
+def service_status(lang="en"):
+    """Answer from the cache. This function never touches the network."""
     base = {"api_base": API_BASE, "partition": PARTITION["partition"],
             "tasks": PARTITION["tasks"],
             "labels": TASK_LABELS.get(lang, TASK_LABELS["en"])}
-    try:
-        with urllib.request.urlopen(request, timeout=5) as response:
-            data = json.load(response)
-        base["model"] = data["data"][0]["id"]
-    except Exception as exc:  # noqa: BLE001
-        return {**base, "online": False, "detail": f"{type(exc).__name__}: {exc}"}
+    with STATUS_LOCK:
+        snapshot = dict(STATUS_CACHE)
     with JOBS_LOCK:
         busy = any(j.get("state") == "running" for j in JOBS.values())
         waiting = sum(1 for j in JOBS.values() if j.get("state") == "queued")
+
+    if snapshot["online"] is None:
+        # No probe has come back yet: still starting, not unreachable.
+        return {**base, "online": False, "starting": True,
+                "detail": snapshot["detail"] or ""}
+    if not snapshot["online"]:
+        return {**base, "online": False, "detail": snapshot["detail"] or ""}
     return {**base, "online": True, "busy": busy, "waiting": waiting,
+            # A probe or two can be swallowed by a busy upstream. Say so
+            # rather than presenting the reading as current.
+            "stale": snapshot["failures"] > 0,
+            "probe_age": round(time.time() - snapshot["checked"], 1),
+            "model": snapshot["model"],
             "profile": ENV.get("H3_CACHE_BACKEND", "none"),
             "attention": ENV.get("H3_DIFFUSION_ATTENTION_BACKEND", ""),
             "execution": ENV.get("H3_EXECUTION_MODE", "")}
@@ -962,6 +1016,7 @@ const STRINGS = {
     "hdr.idle": "online · idle",
     "hdr.queue": " · queue {n}",
     "hdr.offline": "unreachable",
+    "hdr.stale": " · reading is a moment old",
     "hdr.uierror": "frontend error",
     "label.mode": "Mode",
     "opt.structured": "Structured prompt (H3's own format)",
@@ -1035,6 +1090,7 @@ const STRINGS = {
     "hdr.idle": "服務中 · 閒置",
     "hdr.queue": " · 佇列 {n}",
     "hdr.offline": "無法連線",
+    "hdr.stale": " · 讀數稍舊",
     "hdr.uierror": "前端錯誤",
     "label.mode": "生成模式",
     "opt.structured": "結構化 prompt（H3 官方格式）",
@@ -1207,8 +1263,14 @@ async function poll() {
     if (s.online) {
       $("svc").className = "pill ok";
       $("svc").textContent = tr(s.busy ? "hdr.busy" : "hdr.idle") +
-        (s.waiting ? tr("hdr.queue", {n: s.waiting}) : "");
+        (s.waiting ? tr("hdr.queue", {n: s.waiting}) : "") +
+        (s.stale ? tr("hdr.stale") : "");
       $("prof").textContent = s.attention + " / " + s.execution + " / cache: " + s.profile;
+    } else if (s.starting) {
+      // No probe has completed yet. Not the same as unreachable.
+      $("svc").className = "pill";
+      $("svc").textContent = tr("hdr.connecting");
+      $("prof").textContent = s.detail || "";
     } else {
       $("svc").className = "pill bad";
       $("svc").textContent = tr("hdr.offline");
@@ -1450,6 +1512,8 @@ $("go").onclick = async () => {
 if __name__ == "__main__":
     MEDIA.mkdir(exist_ok=True)
     threading.Thread(target=worker_loop, daemon=True, name="JobQueue").start()
+    threading.Thread(target=status_prober_loop, daemon=True,
+                     name="StatusProbe").start()
     print(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
     print(f"upstream: {API_BASE}  auth: {'on' if API_KEY else 'off'}")
     print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}")
