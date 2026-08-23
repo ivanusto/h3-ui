@@ -6,26 +6,24 @@ A thin browser frontend for video generation on a [vLLM-Omni](https://github.com
 
 One file, standard library only, no build step. Point it at a running server and open a browser.
 
-![The h3-ui interface in English](docs/ui-en.png)
+![The h3-ui interface with finished clips in the history](docs/h3_ui.jpg)
 
 It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bodies, base64 attachments, an API key you don't want in your shell history, and generations long enough that a dropped connection loses the result. This sits in front of that and keeps the key server-side.
 
-![The h3-ui interface with finished clips in the history](docs/h3_ui.jpg)
-
 ## What it does
 
-- **Text, first-frame, and reference conditioning** — the task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
-- **Attachment rules enforced before submitting** — each task states what it accepts, and the form refuses mismatched combinations instead of letting the server 400.
-- **A real queue** — submit as many jobs as you like without waiting. A single worker drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
-- **Jobs survive the page** — generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a ten-minute render. The finished video appears whenever you come back.
-- **Reproducible by default** — every result writes a sidecar JSON with the exact parameters beside the video.
-- **Random seeds** — 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the seed box and shown on completion, so a lucky result is never lost to a number you can't recover.
-- **Structured prompts** — H3 expects three named sections rather than free text. The form gives you each one, with a format crib sheet, and builds the FL2VA alignment line from the duration you set so its timestamp can't drift out of sync. Plain text still works if you'd rather write it yourself.
-- **Delete what didn't work** — trial runs and failures can be removed from the history, video and sidecar together.
+- **Text, first-frame, and reference conditioning**: the task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
+- **Attachment rules enforced before submitting**: each task states what it accepts, and the form refuses mismatched combinations instead of letting the server 400.
+- **A real queue**: submit as many jobs as you like without waiting. One worker per configured upstream drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
+- **Jobs survive the page**: generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a ten-minute render. The finished video appears whenever you come back.
+- **Reproducible by default**: every result writes a sidecar JSON with the exact parameters beside the video.
+- **Random seeds**: 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the seed box and shown on completion, so a lucky result is never lost to a number you can't recover.
+- **Structured prompts**: H3 expects three named sections rather than free text. The form gives you each one, with a format crib sheet, and builds the FL2VA alignment line from the duration you set so its timestamp can't drift out of sync. Plain text still works if you'd rather write it yourself.
+- **Delete what didn't work**: trial runs and failures can be removed from the history, video and sidecar together.
 
 ## Requirements
 
-- Python 3.10+ — standard library only, nothing to install
+- Python 3.10+, standard library only, nothing to install
 - A reachable vLLM-Omni server serving a video model
 
 ## Setup
@@ -81,7 +79,7 @@ tensor or sequence parallelism. What you get is one job per box at a time.
 
 The interface comes in English and Traditional Chinese, chosen from the browser:
 **Traditional Chinese locales (`zh-TW` / `zh-Hant` / `zh-HK` / `zh-MO`) get Chinese;
-everything else — `zh-CN` included — gets English.** The link in the header switches
+everything else, `zh-CN` included, gets English.** The link in the header switches
 by hand, and the choice is remembered in that browser's `localStorage`.
 
 Server-side error messages follow the same choice: the page sends `X-Lang` with every
@@ -92,7 +90,7 @@ The Chinese page looks like [this](docs/ui-zh.png).
 
 ## Security
 
-**This process holds your API key and will proxy whatever a browser asks of it.** There is no authentication on the UI itself — that is deliberate for a loopback tool, and it is exactly why the default bind is `127.0.0.1`.
+**This process holds your API key and will proxy whatever a browser asks of it.** There is no authentication on the UI itself. That is deliberate for a loopback tool, and it is exactly why the default bind is `127.0.0.1`.
 
 Setting `H3_UI_HOST` to a LAN address hands your API key's capabilities to everyone who can reach that port. Do it only on a network you trust, and prefer an SSH tunnel if you just need it from another machine:
 
@@ -120,7 +118,7 @@ Deleting a result unlinks it immediately. There is no trash, and the browser's c
 }
 ```
 
-Paste those values back into the form — with the random checkbox off — and you get the same video.
+Paste those values back into the form, with the random checkbox off, and you get the same video.
 
 **Estimates** are extrapolated from one measured run, scaling with `width × height × steps × duration`. Treat them as an order of magnitude, not a promise; caching and step-time drift move the real number around.
 
@@ -154,7 +152,7 @@ overall_soundscape: Wooden shutters scrape open over a quiet street…
 non_diegetic_music: A soft acoustic-guitar pattern at a moderate tempo.
 ```
 
-`overall_soundscape` is what the characters can hear; `non_diegetic_music` is score only the audience hears — `N/A` for none. Shots are `[Shot 1]`, then `[Shot 2] At 00:03.500, the camera cuts to…`. Camera moves have a fixed vocabulary (`Push In`, `Truck Left`, `Arc Shot`, …) optionally qualified `with small amplitude` / `at slow speed`. Dialogue is `<d>[English] …</d>` with the speaker tagged `(S1)`.
+`overall_soundscape` is what the characters can hear; `non_diegetic_music` is score only the audience hears, `N/A` for none. Shots are `[Shot 1]`, then `[Shot 2] At 00:03.500, the camera cuts to…`. Camera moves have a fixed vocabulary (`Push In`, `Truck Left`, `Arc Shot`, …) optionally qualified `with small amplitude` / `at slow speed`. Dialogue is `<d>[English] …</d>` with the speaker tagged `(S1)`.
 
 For `fl2va` the guide also wants a leading line stating where each reference picture lands on the timeline. It's generated from `duration` and the last `[Shot N]` in your description, so the timestamp can't disagree with what you actually asked for:
 
@@ -187,11 +185,11 @@ Attachments are data URLs: `{"image": "data:image/png;base64,..."}`, or `{"video
 
 ## Scope
 
-The server contract is vLLM-Omni's `POST /v1/videos/sync`. The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific — a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
+The server contract is vLLM-Omni's `POST /v1/videos/sync`. The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific: a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
 
-Image generation is **not** implemented. vLLM-Omni does expose `/v1/images/generations` and `/v1/images/edits`, so adding it is a matter of a task mode and a shorter result pane rather than new plumbing — whether it produces anything depends on the model actually loaded.
+Image generation is **not** implemented. vLLM-Omni does expose `/v1/images/generations` and `/v1/images/edits`, so adding it is a matter of a task mode and a shorter result pane rather than new plumbing. Whether it produces anything depends on the model actually loaded.
 
-Other things it deliberately doesn't do: no user accounts, no multi-GPU scheduling, no database. Jobs live in memory, so a restart forgets the queue — finished videos are on disk and survive.
+Other things it deliberately doesn't do: no user accounts, no database, and no scheduling cleverer than giving the next queued job to whichever configured upstream is free. Jobs live in memory, so a restart forgets the queue. Finished videos are on disk and survive.
 
 ## Project layout
 
@@ -204,7 +202,7 @@ media/          generated videos and their sidecar JSON (gitignored)
 
 ## A note on long generations
 
-vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which upstream sets to 30 s. If a single denoise step runs longer than that, the output future is cancelled and the server's result-pump thread dies — after which `/health` keeps answering 200 while no request ever returns again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44–48 s per step on the box this was written against.
+vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which upstream sets to 30 s. If a single denoise step runs longer than that, the output future is cancelled and the server's result-pump thread dies, after which `/health` keeps answering 200 while no request ever returns again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44 to 48 s per step on the box this was written against.
 
 Reported as [vllm-project/vllm-omni#5821](https://github.com/vllm-project/vllm-omni/issues/5821), with a build-time fix in [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4). Worth patching before you push step counts up; this frontend can't work around it.
 
