@@ -44,7 +44,8 @@ Resolved in order: process environment → `.env` → default.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL, or several separated by commas (a trailing `/v1` is stripped) |
+| `H3_API_BASES` | *(unset)* | Several vLLM-Omni base URLs, comma separated. Wins over `H3_API_BASE` |
+| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL, commas accepted (a trailing `/v1` is stripped) |
 | `H3_API_KEY` | *(empty)* | Sent as `Authorization: Bearer` when set |
 | `H3_UI_HOST` | `127.0.0.1` | UI bind address |
 | `H3_UI_PORT` | `8080` | UI port |
@@ -52,12 +53,16 @@ Resolved in order: process environment → `.env` → default.
 
 ## More than one box
 
-`H3_API_BASE` accepts a comma separated list, so several machines can each run
+Set `H3_API_BASES` to a comma separated list, so several machines can each run
 their own vLLM-Omni behind one queue:
 
 ```
-H3_API_BASE=http://192.168.2.131:8002,http://192.168.2.141:8002
+H3_API_BASES=http://192.168.2.131:8002,http://192.168.2.141:8002
 ```
+
+A comma separated `H3_API_BASE` works too, but prefer the plural when the file
+is shared with the deployment repo: its scripts read `H3_API_BASE` as a single
+URL and build health check addresses from it, so a list there breaks them.
 
 Each upstream gets its own worker, all drawing from the same FIFO, so whichever
 box frees up first takes the next job and submission order is still the order

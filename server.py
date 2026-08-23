@@ -158,13 +158,20 @@ def normalise_base(value):
     return base[: -len("/v1")] if base.endswith("/v1") else base
 
 
-# H3_API_BASE takes a comma separated list, so two GB10 boxes can each serve
-# their own vLLM-Omni. A model cannot span them: the diffusion executor only
-# ever spawns local processes, so there is no cross-machine tensor or sequence
-# parallelism to be had. The win is one job per box at a time, not one job
-# finishing twice as fast.
+# Several upstreams, so two GB10 boxes can each serve their own vLLM-Omni. A
+# model cannot span them: the diffusion executor only ever spawns local
+# processes, so there is no cross-machine tensor or sequence parallelism to be
+# had. The win is one job per box at a time, not one job finishing twice as
+# fast.
+#
+# H3_API_BASES is the one to set when this .env is shared with the deployment
+# repo, whose scripts read H3_API_BASE as a single URL and build health check
+# addresses out of it. A comma separated H3_API_BASE still works when nothing
+# else reads the file.
 API_BASES = [normalise_base(part)
-             for part in setting("H3_API_BASE", "http://127.0.0.1:8000").split(",")
+             for part in setting("H3_API_BASES",
+                                 setting("H3_API_BASE",
+                                         "http://127.0.0.1:8000")).split(",")
              if part.strip()]
 API_BASE = API_BASES[0]
 API_KEY = ENV.get("H3_API_KEY", "")

@@ -44,7 +44,8 @@ python3 server.py
 
 | 變數 | 預設值 | 意義 |
 |---|---|---|
-| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL，可用逗號分隔多個（結尾的 `/v1` 會被去掉） |
+| `H3_API_BASES` | *(未設定)* | 多個 vLLM-Omni base URL，逗號分隔。優先於 `H3_API_BASE` |
+| `H3_API_BASE` | `http://127.0.0.1:8000` | vLLM-Omni base URL，也接受逗號分隔（結尾的 `/v1` 會被去掉） |
 | `H3_API_KEY` | *(空)* | 有設定時以 `Authorization: Bearer` 送出 |
 | `H3_UI_HOST` | `127.0.0.1` | UI 綁定位址 |
 | `H3_UI_PORT` | `8080` | UI 連接埠 |
@@ -52,11 +53,14 @@ python3 server.py
 
 ## 多台主機
 
-`H3_API_BASE` 可以用逗號分隔多個位址，讓多台機器各自跑自己的 vLLM-Omni，共用同一條佇列：
+把 `H3_API_BASES` 設成逗號分隔的清單，讓多台機器各自跑自己的 vLLM-Omni，共用同一條佇列：
 
 ```
-H3_API_BASE=http://192.168.2.131:8002,http://192.168.2.141:8002
+H3_API_BASES=http://192.168.2.131:8002,http://192.168.2.141:8002
 ```
+
+`H3_API_BASE` 用逗號分隔也可以，但這個檔案若與部署 repo 共用，請用複數的那個：
+部署腳本把 `H3_API_BASE` 當成單一 URL 拿去組健康檢查位址，寫成清單會讓它們壞掉。
 
 每個後端有自己的 worker，全部從同一條 FIFO 取件，所以哪台先空出來就接下一個工作，
 送出的順序仍然是開始執行的順序。結果透過 HTTP 收回，寫在跑 UI 的那台，所以作品集
