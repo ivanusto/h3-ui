@@ -614,6 +614,28 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self._send(404, json.dumps({"error": "not found"}))
 
+    @staticmethod
+    def parse_range(header, size):
+        """(start, end) for a single `bytes=` range, or None for the whole file.
+
+        Only the one-range form browsers send for media is handled; anything
+        else falls back to the full body rather than erroring.
+        """
+        match = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+        if not match or size == 0:
+            return None
+        first, last = match.group(1), match.group(2)
+        if first:
+            start = int(first)
+            end = int(last) if last else size - 1
+        elif last:                      # bytes=-500 is the final 500 bytes
+            start, end = max(0, size - int(last)), size - 1
+        else:
+            return None
+        if start >= size or start > end:
+            return None
+        return start, min(end, size - 1)
+
     def serve_media(self, name):
         if not re.fullmatch(r"[A-Za-z0-9._-]+", name):
             self._send(400, json.dumps({"error": "bad name"}))
@@ -623,7 +645,34 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
             return
         kind = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        self._send(200, target.read_bytes(), kind, {"Accept-Ranges": "none"})
+        size = target.stat().st_size
+        span = self.parse_range(self.headers.get("Range"), size)
+        start, end = span if span else (0, size - 1)
+        length = end - start + 1
+
+        self.send_response(206 if span else 200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        if span:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.end_headers()
+        if self.command == "HEAD":
+            return
+        try:
+            with target.open("rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = handle.read(min(256 * 1024, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            # Routine: the gallery re-renders and the browser drops the
+            # transfers it no longer needs.
+            pass
 
     def do_DELETE(self):
         path = self.path.split("?")[0]
