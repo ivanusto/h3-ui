@@ -10,7 +10,7 @@ One file, standard library only, no build step. Point it at a running server and
 
 It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bodies, base64 attachments, an API key you don't want in your shell history, and generations long enough that a dropped connection loses the result. This sits in front of that and keeps the key server-side.
 
-!(H3 UI](docs/h3_ui.jpg)
+![The h3-ui interface with finished clips in the history](docs/h3_ui.jpg)
 
 ## What it does
 

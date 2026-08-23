@@ -10,7 +10,7 @@
 
 它存在的理由是：手動對 `/v1/videos/sync` 送請求很煩——multipart 的 body、base64 的附件、一把你不想留在 shell 歷史裡的 API key，以及長到連線一斷就前功盡棄的生成時間。這支程式擋在前面，並把金鑰留在伺服器端。
 
-![The h3-ui interface in English](docs/h3_ui.png)
+![h3-ui 介面與歷史區的成品](docs/h3_ui.jpg)
 
 ## 它能做什麼
 
