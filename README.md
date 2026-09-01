@@ -28,23 +28,100 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 
 ## Server compatibility
 
-h3-ui speaks the vLLM-Omni video contract as it stood in the `minimax-h3` image
-published on 2026-08-02: the canvas comes from `width` and `height`, and nothing
-bounds the duration from below.
+h3-ui speaks two request contracts, chosen with `H3_SERVER_CONTRACT`.
 
-Newer vLLM-Omni builds changed MiniMax H3's request rules. Measured against the
-2026-08-22 nightly on a GB10:
+`current` (the default) is what vLLM-Omni has wanted since the 2026-08-22
+nightly:
 
 - Output duration has to be between 4 and 15 seconds. A 2 second request comes
-  back as `500 MiniMax H3 output duration must be in [4, 15] seconds`.
+  back as `500 MiniMax H3 output duration must be in [4, 15] seconds`, so the
+  duration box is bounded here rather than upstream.
 - `t2va` needs an explicit named `aspect_ratio`, one of `21:9`, `16:9`, `4:3`,
-  `1:1`, `3:4`, `9:16`. Sending `width` and `height` instead returns
-  `500 t2va requires an explicit aspect_ratio`, and `adaptive` or `auto` are
-  refused for `t2va`. `fl2va` takes its ratio from the input image either way.
+  `1:1`, `3:4`, `9:16`. The form sends the name closest to the canvas you set;
+  `width` and `height` still decide the canvas, exactly as the upstream recipe
+  pairs 960x576 with `16:9`. `fl2va` takes its ratio from the input image and
+  `ref2va` defaults to 16:9, so neither is sent one.
 
-So the resolution box and any duration under 4 seconds will fail against a
-recent server. Point h3-ui at a server built from the older image until the form
-speaks both contracts, or read the reason in the job's error field.
+`legacy` is the `minimax-h3` image published on 2026-08-02: the canvas alone was
+enough and nothing bounded the duration from below. Set it if you still run that
+image.
+
+### FastH3
+
+[FastH3](https://haoailab.com/blogs/fasth3-preview/) is FastVideo's four-step
+DMD2 student of MiniMax-H3. vLLM-Omni fuses it into the checkpoint at load time
+from `--lora-path`; it is not a request-switchable LoRA, so a fused server
+changes the request contract rather than offering an option:
+
+- `num_inference_steps` must be exactly 4.
+- Only `t2va` is served, because preview v1 distils only that task.
+- `flow_shift` and `audio_flow_shift` are owned by the fused schedule. The
+  server accepts a value only when it equals the checkpoint's own, and answers
+  `500 FastH3 requires flow_shift=12, got 8` for anything else. h3-ui omits them
+  rather than echoing a form default, which is the only option that cannot
+  disagree with a schedule this process never sees.
+
+Nothing on the wire says the adapter is fused: `/v1/models` is unchanged and so
+is `model_index.json`. So h3-ui cannot detect it and has to be told, with
+`H3_LORA_PATH` (the same value the server was given) or `H3_FASTH3`. When told,
+the steps box locks to 4, both shift boxes disappear, the mode list narrows to
+`t2va`, and every result records which adapter produced it.
+
+On one GB10 with online FP8, full compute, 960x576, 4.4 s, seed 1101, the
+adapter took a 50 step render from 1034 s to 114 s, and 63 s at 768x448.
+
+A checkpoint that is itself distilled needs no setting: it declares its schedule
+in `_minimax_h3`, and the same lock applies.
+
+With more than one upstream this is all-or-nothing. The setting is process wide
+and cannot be checked per box, so every configured server must have been started
+with `--lora-path`. A mixed pair fails asymmetrically: the fused box rejects a
+20 step request outright, while a box without the adapter accepts a 4 step
+request and returns mush.
+
+### Recalibrating the time estimate
+
+The hint under the Generate button comes from a cost model, in terms of
+`X = megapixels * seconds of output`:
+
+```
+t = H3_EST_FIXED_SECONDS
+  + H3_EST_PER_MPXS       * X
+  + H3_EST_PER_MPXS_STEP  * X * steps
+  + H3_EST_PER_MPXS2_STEP * X^2 * steps
+```
+
+The second term is what scales with output pixels but not with the step count,
+VAE decode and muxing. The third is the part of a denoise step that is linear
+in tokens and the fourth is attention, which is quadratic in them. H3's token
+count is proportional to `pixels / 32^2` times `frames / 4`, which is why `X` is
+squared rather than pixels or duration on their own.
+
+The shipped defaults were fitted to 11 timed renders on one DGX Spark (GB10),
+online FP8, cuDNN attention, regional compile, no Cache-DiT, spanning 768x448 to
+1344x768, 4.4 s to 12 s and 4 to 50 steps. Worst leave-one-out error 8.4%, mean
+3.8%:
+
+| Canvas | Steps | Duration | Measured | Model |
+| --- | ---: | ---: | ---: | ---: |
+| 768x448 | 4 | 4.4 s | 62.6 s | 63 s |
+| 768x448 | 4 | 8.0 s | 131.1 s | 126 s |
+| 768x448 | 4 | 12.0 s | 211.9 s | 209 s |
+| 768x448 | 10 | 4.4 s | 130.2 s | 130 s |
+| 768x448 | 20 | 4.4 s | 227.1 s | 242 s |
+| 960x576 | 4 | 4.4 s | 113.9 s | 109 s |
+| 960x576 | 4 | 8.0 s | 231.6 s | 228 s |
+| 960x576 | 20 | 4.4 s | 413.7 s | 427 s |
+| 960x576 | 50 | 4.4 s | 1034.5 s | 1025 s |
+| 1344x768 | 4 | 4.4 s | 240.9 s | 236 s |
+| 1344x768 | 4 | 8.0 s | 534.8 s | 538 s |
+
+These constants belong to that profile, not to h3-ui. Different hardware, or
+turning Cache-DiT back on, needs a re-fit: time a handful of renders that vary
+the canvas, the duration and the step count, then solve for the three
+coefficients. A constant term was tried and rejected, since forcing it to zero
+predicted held-out points better; `H3_EST_FIXED_SECONDS` is there for a box that
+does need one.
 
 ## Setup
 
@@ -70,6 +147,13 @@ Resolved in order: process environment → `.env` → default.
 | `H3_UI_HOST` | `127.0.0.1` | UI bind address |
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
+| `H3_SERVER_CONTRACT` | `current` | `current` or `legacy`; see Server compatibility |
+| `H3_LORA_PATH` | *(empty)* | The adapter the server was started with. Set means FastH3 is fused |
+| `H3_FASTH3` | *(unset)* | Override: a switch, or the step count the fused adapter pins. `0` forces off |
+| `H3_EST_FIXED_SECONDS` | `0` | Constant term of the time estimate |
+| `H3_EST_PER_MPXS` | `11.88` | Cost per megapixel-second, independent of the step count |
+| `H3_EST_PER_MPXS_STEP` | `6.05` | The part of a step that is linear in tokens |
+| `H3_EST_PER_MPXS2_STEP` | `0.88` | Attention, quadratic in tokens |
 
 ## More than one box
 
@@ -138,9 +222,12 @@ Deleting a result unlinks it immediately. There is no trash, and the browser's c
 }
 ```
 
+A FastH3 result carries `"adapter": "fasth3 (dense-datafree)"` instead of the
+two shift fields, because those were never part of the request.
+
 Paste those values back into the form, with the random checkbox off, and you get the same video.
 
-**Estimates** are extrapolated from one measured run, scaling with `width × height × steps × duration`. Treat them as an order of magnitude, not a promise; caching and step-time drift move the real number around.
+**Estimates** come from a cost model fitted to timed renders on the box that measured it, described under [Recalibrating the time estimate](#recalibrating-the-time-estimate). Held-out error there was under 9%, but the constants describe that machine and that profile: on anything else, treat the number as an order of magnitude.
 
 ## HTTP API
 

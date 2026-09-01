@@ -44,10 +44,23 @@ ENV_FILE = next(
 REQUEST_TIMEOUT = 7200
 MAX_BODY = 512 * 1024 * 1024
 
-# Measured here: 768x448, 20 steps, 2.0 s took ~84 s on the Cache-DiT 0.10
-# profile. Used only for the UI's rough time estimate.
-REF_COST = 768 * 448 * 20 * 2.0
-REF_SECONDS = 84.0
+# Cost model for the UI's time estimate, in terms of X = megapixels * seconds
+# of output:
+#
+#     t = FIXED + PER_MPXS*X + PER_MPXS_STEP*X*steps + PER_MPXS2_STEP*X^2*steps
+#
+# The first term is what runs once per request and does not scale at all. The
+# second scales with output pixels but not with the step count: VAE decode and
+# muxing. The third is the part of a denoise step that is linear in tokens, and
+# the fourth is attention, which is quadratic in them. H3's token count is
+# proportional to pixels/32^2 times frames/4, which is why X appears squared
+# rather than pixels or duration separately.
+#
+# Defaults fit on 11 measured renders on one DGX Spark (GB10), online FP8,
+# cuDNN attention, regional compile, no Cache-DiT, spanning 768x448 to
+# 1344x768, 4.4 s to 12 s, and 4 to 50 steps. Worst leave-one-out error 8.4%,
+# mean 3.8%. They are tied to that profile: a different accelerator, or turning
+# Cache-DiT back on, needs a re-fit. See "Recalibrating" in the README.
 
 # torch seeds are unsigned 64-bit, but keeping this inside int32 avoids any
 # rounding surprise in the browser (JS numbers lose integer precision above
@@ -191,16 +204,126 @@ API_BASES = [normalise_base(part)
 API_BASE = API_BASES[0]
 API_KEY = ENV.get("H3_API_KEY", "")
 
+# Which request contract the upstream speaks. "current" is what vLLM-Omni has
+# wanted since the 2026-08-22 nightly: t2va needs a named aspect ratio, and the
+# clip has to be at least four seconds. "legacy" is the minimax-h3 image
+# published on 2026-08-02, where the canvas alone was enough and nothing
+# bounded the duration from below.
+# Anything that is not the word "legacy" is treated as current, because that is
+# the safe direction to guess in: sending a named ratio to the old image is
+# ignored, while omitting one on a current server fails the request.
+SERVER_CONTRACT = "legacy" if setting(
+    "H3_SERVER_CONTRACT", "current").strip().lower() == "legacy" else "current"
+DURATION_MIN, DURATION_MAX = (0.5, 60.0) if SERVER_CONTRACT == "legacy" else (4.0, 15.0)
+
+# The named ratios t2va accepts. width and height still set the canvas; the
+# ratio is a separate named field the server refuses to infer, so the nearest
+# name is what it wants, not an exact match: the upstream recipe itself pairs
+# 960x576 with 16:9.
+NAMED_RATIOS = (("21:9", 21 / 9), ("16:9", 16 / 9), ("4:3", 4 / 3),
+                ("1:1", 1.0), ("3:4", 3 / 4), ("9:16", 9 / 16))
+
+# FastH3's five sigma points bound four denoiser evaluations. Only used as the
+# default when H3_FASTH3 is a bare switch; an integer there wins.
+FASTH3_STEPS = 4
+
+# The fit found no constant term worth keeping: forcing it to zero was better
+# held out than fitting it, so this ships as 0 and is here for a deployment
+# whose own measurements disagree.
+EST_FIXED = float(setting("H3_EST_FIXED_SECONDS", "0"))
+EST_PER_MPXS = float(setting("H3_EST_PER_MPXS", "11.88"))
+EST_PER_MPXS_STEP = float(setting("H3_EST_PER_MPXS_STEP", "6.05"))
+EST_PER_MPXS2_STEP = float(setting("H3_EST_PER_MPXS2_STEP", "0.88"))
+
+
+def named_ratio(width, height):
+    """The named aspect ratio closest to a canvas."""
+    if not width or not height:
+        return "16:9"
+    target = width / height
+    return min(NAMED_RATIOS, key=lambda item: abs(item[1] - target))[0]
+
+
+def fasth3_steps(value):
+    """H3_FASTH3 read as a switch or as a step count.
+
+    None when unset, 0 when explicitly off, otherwise the step count the fused
+    adapter pins. The integer form is what saves this if FastVideo ships a two
+    or eight step student later.
+    """
+    if value is None or value == "":
+        return None
+    text = str(value).strip().lower()
+    if text in ("0", "false", "off", "no"):
+        return 0
+    if text in ("1", "true", "on", "yes"):
+        return FASTH3_STEPS
+    try:
+        return max(int(text), 0)
+    except ValueError:
+        return FASTH3_STEPS
+
+
+def schedule_steps(meta):
+    """The step count a distilled checkpoint pins, or None.
+
+    Never a bare len(): a rectified flow schedule closes on a terminal 0, so
+    the point count is one more than the number of denoiser evaluations.
+    Anything unrecognised returns None rather than a guess.
+    """
+    explicit = meta.get("num_inference_steps")
+    if isinstance(explicit, int) and explicit > 0:
+        return explicit
+    schedule = meta.get("base_schedule")
+    if isinstance(schedule, dict):
+        schedule = schedule.get("sigmas") or schedule.get("positions")
+    if not isinstance(schedule, (list, tuple)) or len(schedule) < 2:
+        return None
+    try:
+        tail = float(schedule[-1])
+    except (TypeError, ValueError):
+        return None
+    return len(schedule) - 1 if tail == 0 else len(schedule)
+
+
+def adapter_label(path):
+    """Name the fused adapter by the variant directory it came from."""
+    if not path:
+        return "fasth3"
+    variant = Path(path).parent.name
+    return f"fasth3 ({variant})" if variant else "fasth3"
+
 
 def load_partition():
-    """Read the served checkpoint's partition and task list."""
+    """The served checkpoint's partition, task list and pinned schedule.
+
+    Two different things can pin the step count. A distilled checkpoint says so
+    in its own metadata and the server pins the count from there. A FastH3
+    adapter fused with --lora-path says nothing at all: /v1/models is unchanged
+    and so is model_index.json, so that one can only come from configuration.
+    """
+    info = {"partition": "unknown", "tasks": ["t2va"],
+            "pinned_steps": None, "locked_shifts": False, "adapter": None}
     model_dir = ENV.get("MINIMAX_H3_MODEL_DIR", "")
     index = Path(model_dir) / "model_index.json" if model_dir else None
-    if not index or not index.is_file():
-        return {"partition": "unknown", "tasks": ["t2va"]}
-    meta = json.loads(index.read_text(encoding="utf-8")).get("_minimax_h3", {})
-    return {"partition": meta.get("partition", "unknown"),
-            "tasks": list(meta.get("tasks") or ["t2va"])}
+    if index and index.is_file():
+        meta = json.loads(index.read_text(encoding="utf-8")).get("_minimax_h3", {})
+        info["partition"] = meta.get("partition", "unknown")
+        info["tasks"] = list(meta.get("tasks") or ["t2va"])
+        pinned = schedule_steps(meta)
+        if pinned:
+            info.update(pinned_steps=pinned, locked_shifts=True,
+                        adapter="a distilled checkpoint")
+    # The adapter is fused over whatever the checkpoint says, so it wins. A
+    # FastH3 box may not set MINIMAX_H3_MODEL_DIR at all, which is why this
+    # sits outside the block above.
+    lora_path = setting("H3_LORA_PATH", "")
+    override = fasth3_steps(setting("H3_FASTH3", ""))
+    fused = override if override is not None else (FASTH3_STEPS if lora_path else 0)
+    if fused:
+        info.update(pinned_steps=fused, locked_shifts=True, tasks=["t2va"],
+                    adapter=adapter_label(lora_path))
+    return info
 
 
 PARTITION = load_partition()
@@ -259,16 +382,28 @@ def encode_multipart(fields, files):
 
 def build_request(params, attachments, lang="en"):
     """Translate UI parameters into the vLLM-Omni video request."""
-    extra = {"task": params["task"], "duration": params["duration"],
-             "audio_flow_shift": params["audio_flow_shift"]}
+    extra = {"task": params["task"], "duration": params["duration"]}
     fields = {
         "prompt": params["prompt"],
         "num_inference_steps": params["steps"],
-        "flow_shift": params["flow_shift"],
         "seed": params["seed"],
         "fps": params["fps"],
-        "extra_params": json.dumps(extra),
     }
+    # A fused schedule owns both shifts: measured against the 2026-08-31 nightly,
+    # the server accepts a value only when it equals the checkpoint's own (12 and
+    # 3 for FastH3) and answers "FastH3 requires flow_shift=12, got 8" otherwise.
+    # Omitting them is always accepted, and it is the only option that cannot
+    # disagree with a schedule this process never sees.
+    if not PARTITION["locked_shifts"]:
+        fields["flow_shift"] = params["flow_shift"]
+        extra["audio_flow_shift"] = params["audio_flow_shift"]
+    # t2va on a current build wants a named ratio and refuses to infer one from
+    # the canvas. fl2va takes its ratio from the input image and ref2va
+    # defaults to 16:9, so neither is sent one.
+    if SERVER_CONTRACT == "current" and params["task"] == "t2va":
+        fields["aspect_ratio"] = named_ratio(params.get("width"),
+                                             params.get("height"))
+    fields["extra_params"] = json.dumps(extra)
     # fl2va derives the canvas from the reference image when width/height are
     # omitted; the UI exposes that as "follow the image".
     if params.get("width") and params.get("height"):
@@ -531,10 +666,14 @@ def resolve_seed(value):
 
 
 def estimate_seconds(params):
+    """Rough wall clock for one render. See the cost model above."""
     width = params.get("width") or 1344
     height = params.get("height") or 768
-    cost = width * height * params["steps"] * params["duration"]
-    return round(REF_SECONDS * cost / REF_COST)
+    steps = params["steps"]
+    x = width * height / 1e6 * params["duration"]
+    seconds = (EST_FIXED + EST_PER_MPXS * x + EST_PER_MPXS_STEP * x * steps
+               + EST_PER_MPXS2_STEP * x * x * steps)
+    return max(round(seconds), 1)
 
 
 # The upstream probe runs on its own thread, never inside a request. A
@@ -605,6 +744,14 @@ def service_status(lang="en"):
     """Answer from the cache. This function never touches the network."""
     base = {"api_bases": API_BASES, "partition": PARTITION["partition"],
             "tasks": PARTITION["tasks"],
+            "pinned_steps": PARTITION["pinned_steps"],
+            "locked_shifts": PARTITION["locked_shifts"],
+            "adapter": PARTITION["adapter"],
+            "contract": SERVER_CONTRACT,
+            "duration_min": DURATION_MIN, "duration_max": DURATION_MAX,
+            "est": {"fixed": EST_FIXED, "per_mpxs": EST_PER_MPXS,
+                    "per_mpxs_step": EST_PER_MPXS_STEP,
+                    "per_mpxs2_step": EST_PER_MPXS2_STEP},
             "labels": TASK_LABELS.get(lang, TASK_LABELS["en"])}
     with JOBS_LOCK:
         busy_bases = {j.get("backend") for j in JOBS.values()
@@ -1220,7 +1367,7 @@ const STRINGS = {
     "rule.ref2va": "An image + audio pair, or one or more reference videos (video mode keeps their own audio, so no separate audio).",
     "fmt.sec": "{n}s",
     "fmt.min": "{m}m {s}s",
-    "est": "Roughly {t} (extrapolated from a measured run on this box's Cache-DiT profile)",
+    "est": "Roughly {t}, from a cost model fitted to timed renders on this box",
     "hist.empty": "Nothing yet.",
     "hist.attached": "attached: ",
     "queue.empty": "The queue is empty.",
@@ -1298,7 +1445,7 @@ const STRINGS = {
     "rule.ref2va": "「圖片＋音訊」成對，或一支以上參考影片（影片模式沿用原聲，不可再附音訊）。",
     "fmt.sec": "{n} 秒",
     "fmt.min": "{m} 分 {s} 秒",
-    "est": "預估耗時約 {t}（依本機實測的 Cache-DiT profile 推算）",
+    "est": "大約 {t}，依本機實測算圖時間擬合出的成本模型推估",
     "hist.empty": "尚無紀錄。",
     "hist.attached": "附件: ",
     "queue.empty": "佇列是空的。",
@@ -1371,6 +1518,11 @@ const RULES = {
   t2va: "rule.t2va", fl2va: "rule.fl2va", ref2va: "rule.ref2va"
 };
 let TASKS = ["t2va"];
+// The cost model's coefficients arrive over /api/status. They used to be
+// written out twice, once here and once in the server, which is exactly how
+// the two drift apart.
+let EST = {fixed: 0, per_mpxs: 11.88, per_mpxs_step: 6.05, per_mpxs2_step: 0.88};
+let CONSTRAINTS = "";
 
 function dims() {
   const p = $("preset").value;
@@ -1381,9 +1533,11 @@ function dims() {
 }
 function estimate() {
   const [w, h] = dims();
-  const cost = (w || 1344) * (h || 768) * (+$("steps").value) * (+$("duration").value);
-  $("est").textContent = tr("est",
-    {t: fmt(84 * cost / (768 * 448 * 20 * 2.0))});
+  const steps = +$("steps").value;
+  const x = (w || 1344) * (h || 768) / 1e6 * (+$("duration").value);
+  const secs = EST.fixed + EST.per_mpxs * x + EST.per_mpxs_step * x * steps +
+               EST.per_mpxs2_step * x * x * steps;
+  $("est").textContent = tr("est", {t: fmt(Math.max(secs, 1))});
 }
 function syncTask() {
   const t = $("task").value;
@@ -1396,10 +1550,56 @@ function syncTask() {
   syncAlignHint();
 }
 $("task").onchange = syncTask;
+
+// What the upstream will and will not accept, applied from /api/status. The
+// signature guard matters: poll() runs every five seconds and must not stomp a
+// box the user is halfway through editing.
+function applyConstraints(s) {
+  const sig = JSON.stringify([s.pinned_steps, s.locked_shifts, s.adapter,
+                              s.est, s.duration_min, s.duration_max]);
+  if (sig === CONSTRAINTS) return;
+  CONSTRAINTS = sig;
+  if (s.est) EST = s.est;
+
+  const pinned = s.pinned_steps || 0;
+  // readOnly, not disabled: a disabled field is not submitted.
+  $("steps").readOnly = !!pinned;
+  if (pinned) $("steps").value = pinned;
+  $("steps-note").textContent = pinned
+    ? tr("note.stepslocked", {n: pinned, a: s.adapter || "the checkpoint"}) : "";
+
+  const locked = !!s.locked_shifts;
+  $("flow-wrap").style.display = locked ? "none" : "block";
+  $("aflow-wrap").style.display = locked ? "none" : "block";
+  // Hiding two of three cells would leave the seed box alone in a three column
+  // grid with two gaps.
+  $("shift-row").style.gridTemplateColumns = locked ? "1fr" : "";
+
+  if (s.duration_min != null) {
+    $("duration").min = s.duration_min;
+    if (+$("duration").value < s.duration_min) $("duration").value = s.duration_min;
+  }
+  if (s.duration_max != null) $("duration").max = s.duration_max;
+  estimate();
+  syncAlignHint();
+}
+
+function clampDuration() {
+  const lo = +$("duration").min || 0;
+  if (+$("duration").value < lo) $("duration").value = lo;
+}
+
 $("preset").onchange = () => {
   $("wh").style.display = $("preset").value === "custom" ? "grid" : "none";
-  if ($("preset").value === "1344x768") { $("steps").value = 50; $("duration").value = 4.0; }
-  if ($("preset").value === "768x448") { $("steps").value = 20; $("duration").value = 2.0; }
+  // The presets write a step count, which would silently unpin a fused
+  // schedule.
+  if (!$("steps").readOnly) {
+    if ($("preset").value === "1344x768") $("steps").value = 50;
+    if ($("preset").value === "768x448") $("steps").value = 20;
+  }
+  if ($("preset").value === "1344x768") $("duration").value = 4.0;
+  if ($("preset").value === "768x448") $("duration").value = 2.0;
+  clampDuration();
   estimate();
 };
 ["steps", "duration", "width", "height"].forEach(id => $(id).oninput = estimate);
