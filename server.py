@@ -78,6 +78,7 @@ MESSAGES = {
         "attachment_decode": "Attachment base64 decode failed: {error}",
         "body_too_large": "Attachments too large (512 MB limit)",
         "duration_number": "duration must be a number",
+        "duration_range": "duration must be between {lo} and {hi} seconds",
         "fl2va_image_only": "fl2va takes an image only, not audio or video",
         "fl2va_needs_image": "fl2va needs one first-frame image",
         "forget_state": "Still {state}; cannot remove it from the list",
@@ -88,7 +89,16 @@ MESSAGES = {
         "ref2va_video_exclusive":
             "ref2va's reference-video mode keeps the video's own audio; "
             "don't attach an image or audio as well",
+        "steps_number": "steps must be a whole number",
+        "steps_pinned":
+            "This server has {adapter} fused: num_inference_steps must be "
+            "exactly {steps}",
+        "shifts_locked":
+            "flow_shift and audio_flow_shift are owned by the fused {adapter} "
+            "schedule, so h3-ui does not send them",
         "t2va_no_attachments": "t2va takes no attachments",
+        "task_adapter":
+            "{adapter} is fused on this server, which only serves {tasks}",
         "task_unsupported":
             "The loaded checkpoint ({partition}) only supports {tasks}",
     },
@@ -97,6 +107,7 @@ MESSAGES = {
         "attachment_decode": "附件 base64 解碼失敗: {error}",
         "body_too_large": "附件過大（上限 512 MB）",
         "duration_number": "duration 必須是數字",
+        "duration_range": "duration 必須介於 {lo} 到 {hi} 秒",
         "fl2va_image_only": "fl2va 只接受圖片，不接受音訊或影片",
         "fl2va_needs_image": "fl2va 必須提供一張首格圖片",
         "forget_state": "還在 {state}，無法從清單移除",
@@ -104,7 +115,11 @@ MESSAGES = {
         "prompt_required": "prompt 不可為空",
         "ref2va_pair_or_video": "ref2va 需要「圖片＋音訊」成對，或一支以上參考影片",
         "ref2va_video_exclusive": "ref2va 的參考影片模式沿用影片原聲，不可再附圖片或音訊",
+        "steps_number": "steps 必須是整數",
+        "steps_pinned": "這台伺服器已融合 {adapter}，num_inference_steps 必須剛好是 {steps}",
+        "shifts_locked": "flow_shift 與 audio_flow_shift 由融合的 {adapter} 排程決定，h3-ui 不送這兩個欄位",
         "t2va_no_attachments": "t2va 不接受任何附件",
+        "task_adapter": "這台伺服器已融合 {adapter}，只提供 {tasks}",
         "task_unsupported": "目前 checkpoint（{partition}）只支援 {tasks}",
     },
 }
@@ -816,16 +831,47 @@ class Handler(BaseHTTPRequestHandler):
 
         task = str(payload.get("task", "t2va"))
         if task not in PARTITION["tasks"]:
-            self._send(400, json.dumps(
-                {"error": t(lang, "task_unsupported",
-                            partition=PARTITION["partition"],
-                            tasks=PARTITION["tasks"])}))
+            # Blaming the checkpoint would be a lie when it is the fused
+            # adapter that narrowed the task list.
+            error = (t(lang, "task_adapter", adapter=PARTITION["adapter"],
+                       tasks=PARTITION["tasks"])
+                     if PARTITION["adapter"] else
+                     t(lang, "task_unsupported",
+                       partition=PARTITION["partition"],
+                       tasks=PARTITION["tasks"]))
+            self._send(400, json.dumps({"error": error}))
             return
 
         try:
             duration = float(payload.get("duration", 2.0))
         except (TypeError, ValueError):
             self._send(400, json.dumps({"error": t(lang, "duration_number")}))
+            return
+        if not DURATION_MIN <= duration <= DURATION_MAX:
+            self._send(400, json.dumps(
+                {"error": t(lang, "duration_range", lo=DURATION_MIN,
+                            hi=DURATION_MAX)}))
+            return
+
+        try:
+            steps = int(payload.get("steps", 20))
+        except (TypeError, ValueError):
+            self._send(400, json.dumps({"error": t(lang, "steps_number")}))
+            return
+        # Reject rather than quietly force. A request that asked for 20 steps
+        # and got 4 would leave a sidecar that says something the render never
+        # did.
+        pinned = PARTITION["pinned_steps"]
+        if pinned and steps != pinned:
+            self._send(400, json.dumps(
+                {"error": t(lang, "steps_pinned",
+                            adapter=PARTITION["adapter"], steps=pinned)}))
+            return
+        if PARTITION["locked_shifts"] and (
+                "flow_shift" in payload or "audio_flow_shift" in payload):
+            self._send(400, json.dumps(
+                {"error": t(lang, "shifts_locked",
+                            adapter=PARTITION["adapter"])}))
             return
 
         prompt = compose_prompt(payload, task, duration)
@@ -862,13 +908,19 @@ class Handler(BaseHTTPRequestHandler):
             "prompt": prompt,
             "width": int(payload["width"]) if payload.get("width") else None,
             "height": int(payload["height"]) if payload.get("height") else None,
-            "steps": int(payload.get("steps", 20)),
+            "steps": steps,
             "duration": duration,
             "fps": int(payload.get("fps", 24)),
-            "flow_shift": float(payload.get("flow_shift", 12)),
-            "audio_flow_shift": float(payload.get("audio_flow_shift", 3.0)),
             "seed": resolve_seed(payload.get("seed")),
         }
+        # The sidecar is {**params, ...}, so recording the adapter and dropping
+        # the shifts that were never sent costs one branch each.
+        if PARTITION["locked_shifts"]:
+            params["adapter"] = PARTITION["adapter"]
+        else:
+            params["flow_shift"] = float(payload.get("flow_shift", 12))
+            params["audio_flow_shift"] = float(
+                payload.get("audio_flow_shift", 3.0))
         # Keep the sections as written when the structured form was used, so a
         # result can be reopened and edited rather than only re-run verbatim.
         for key in ("description", "soundscape", "music"):
@@ -1077,13 +1129,13 @@ INDEX_HTML = r"""<!doctype html>
     </div>
 
     <div class="row3">
-      <div><label for="steps">Steps</label><input id="steps" type="number" value="20" min="1" max="200"></div>
+      <div><label for="steps">Steps <span class="note" id="steps-note"></span></label><input id="steps" type="number" value="20" min="1" max="200"></div>
       <div><label for="duration" data-i18n="label.duration"></label><input id="duration" type="number" value="2.0" step="0.5" min="0.5"></div>
       <div><label for="fps">FPS</label><input id="fps" type="number" value="24" readonly></div>
     </div>
-    <div class="row3">
-      <div><label for="flow">Flow shift</label><input id="flow" type="number" value="12" step="0.5"></div>
-      <div><label for="aflow">Audio shift</label><input id="aflow" type="number" value="3.0" step="0.5"></div>
+    <div class="row3" id="shift-row">
+      <div id="flow-wrap"><label for="flow">Flow shift</label><input id="flow" type="number" value="12" step="0.5"></div>
+      <div id="aflow-wrap"><label for="aflow">Audio shift</label><input id="aflow" type="number" value="3.0" step="0.5"></div>
       <div><label for="seed">Seed</label>
         <div class="seed">
           <input id="seed" type="number" value="42" min="0" max="2147483647">
@@ -1130,6 +1182,8 @@ const STRINGS = {
     "hdr.nodes": " · {busy}/{total} boxes busy",
     "hdr.nodeoff": " · {n} unreachable",
     "hdr.uierror": "frontend error",
+    "hdr.adapter": " · {a}",
+    "note.stepslocked": "fixed at {n} by {a}",
     "label.mode": "Mode",
     "opt.structured": "Structured prompt (H3's own format)",
     "note.description": "Framing, action, camera, dialogue, on-scene sound",
@@ -1206,6 +1260,8 @@ const STRINGS = {
     "hdr.nodes": " · {busy}/{total} 台忙碌",
     "hdr.nodeoff": " · {n} 台連不上",
     "hdr.uierror": "前端錯誤",
+    "hdr.adapter": " · {a}",
+    "note.stepslocked": "由 {a} 釘死在 {n} 步",
     "label.mode": "生成模式",
     "opt.structured": "結構化 prompt（H3 官方格式）",
     "note.description": "畫面、動作、運鏡、對白、場景內聲音",
@@ -1374,6 +1430,7 @@ async function poll() {
         `<option value="${t}">${t} — ${(s.labels || {})[t] || ""}</option>`).join("");
       syncTask();
     }
+    applyConstraints(s);
     if (s.online) {
       // With more than one box the header has to say how many are working,
       // and call out any that dropped out rather than hiding it behind an
@@ -1384,6 +1441,7 @@ async function poll() {
         (s.waiting ? tr("hdr.queue", {n: s.waiting}) : "") +
         (many ? tr("hdr.nodes", {busy: s.busy_count, total: s.backend_count}) : "") +
         (s.offline_count ? tr("hdr.nodeoff", {n: s.offline_count}) : "") +
+        (s.adapter ? tr("hdr.adapter", {a: s.adapter}) : "") +
         (s.stale ? tr("hdr.stale") : "");
       $("prof").textContent = s.attention + " / " + s.execution + " / cache: " + s.profile;
     } else if (s.starting) {
@@ -1601,14 +1659,18 @@ $("go").onclick = async () => {
 
   if ($("rand").checked) rollSeed();
 
+  // A locked schedule rejects a request that names either shift, so the page
+  // must not send what it is not showing.
+  const shifts = $("flow-wrap").style.display === "none" ? {} :
+    {flow_shift: +$("flow").value, audio_flow_shift: +$("aflow").value};
+
   $("stat").textContent = tr("stat.sending");
   const res = await api("/api/generate", {
     method: "POST", headers: {"Content-Type": "application/json"},
     body: JSON.stringify({
       task: $("task").value, ...text, width, height,
       steps: +$("steps").value, duration: +$("duration").value,
-      fps: +$("fps").value, flow_shift: +$("flow").value,
-      audio_flow_shift: +$("aflow").value, seed: +$("seed").value, attachments
+      fps: +$("fps").value, ...shifts, seed: +$("seed").value, attachments
     })
   });
   const {position, error} = await res.json();
@@ -1638,5 +1700,15 @@ if __name__ == "__main__":
                          daemon=True, name=f"StatusProbe-{index}").start()
     print(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
     print(f"upstream: {', '.join(API_BASES)}  auth: {'on' if API_KEY else 'off'}")
-    print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}")
+    print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}"
+          f"  contract: {SERVER_CONTRACT}")
+    if PARTITION["adapter"]:
+        print(f"adapter: {PARTITION['adapter']}  "
+              f"steps pinned at {PARTITION['pinned_steps']}, shifts locked")
+        if len(API_BASES) > 1:
+            # Nothing on the wire advertises the fusion, so this cannot be
+            # checked per box. A box started without --lora-path would accept
+            # a four step request and return mush.
+            print("warning: every upstream must have been started with "
+                  "--lora-path; a mixed pair fails silently")
     ThreadingHTTPServer((UI_HOST, UI_PORT), Handler).serve_forever()

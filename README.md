@@ -194,12 +194,17 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d 
   "task": "t2va",
   "prompt": "Rain on a window at night, soft patter.",
   "width": 768, "height": 448,
-  "steps": 20, "duration": 2.0, "fps": 24,
+  "steps": 20, "duration": 4.0, "fps": 24,
   "flow_shift": 12, "audio_flow_shift": 3.0,
   "seed": -1,
   "attachments": {}
 }'
 ```
+
+Against a FastH3 server, `steps` must be `4` and both shift fields have to be
+left out; anything else comes back as a 400 that says which rule it broke,
+rather than being silently rewritten into a render the sidecar would then
+misreport.
 
 Attachments are data URLs: `{"image": "data:image/png;base64,..."}`, or `{"videos": [...]}` for reference conditioning.
 

@@ -181,7 +181,7 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d 
   "task": "t2va",
   "prompt": "Rain on a window at night, soft patter.",
   "width": 768, "height": 448,
-  "steps": 20, "duration": 2.0, "fps": 24,
+  "steps": 20, "duration": 4.0, "fps": 24,
   "flow_shift": 12, "audio_flow_shift": 3.0,
   "seed": -1,
   "attachments": {}
@@ -189,6 +189,9 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d 
 ```
 
 附件是 data URL：`{"image": "data:image/png;base64,..."}`，參考影片條件則用 `{"videos": [...]}`。
+
+對著 FastH3 伺服器時，`steps` 必須是 `4`，兩個 shift 欄位都要省略；不符合就會拿到一個
+說明違反哪條規則的 400，而不是被默默改寫成一次 sidecar 會記錯的算圖。
 
 ## 範圍
 
