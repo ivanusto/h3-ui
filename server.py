@@ -103,6 +103,11 @@ MESSAGES = {
             "ref2va's reference-video mode keeps the video's own audio; "
             "don't attach an image or audio as well",
         "steps_number": "steps must be a whole number",
+        "turbo_unavailable": "This server has no request-switchable adapter",
+        "turbo_fused":
+            "{adapter} is fused into this server's checkpoint, which refuses a "
+            "request that also names a LoRA",
+        "turbo_task": "{name} does not serve {task}; it serves {tasks}",
         "steps_pinned":
             "This server has {adapter} fused: num_inference_steps must be "
             "exactly {steps}",
@@ -129,6 +134,9 @@ MESSAGES = {
         "ref2va_pair_or_video": "ref2va 需要「圖片＋音訊」成對，或一支以上參考影片",
         "ref2va_video_exclusive": "ref2va 的參考影片模式沿用影片原聲，不可再附圖片或音訊",
         "steps_number": "steps 必須是整數",
+        "turbo_unavailable": "這台伺服器沒有可逐請求切換的 adapter",
+        "turbo_fused": "這台伺服器已把 {adapter} 融進 checkpoint，會拒收同時指名 LoRA 的請求",
+        "turbo_task": "{name} 不提供 {task}，只提供 {tasks}",
         "steps_pinned": "這台伺服器已融合 {adapter}，num_inference_steps 必須剛好是 {steps}",
         "shifts_locked": "flow_shift 與 audio_flow_shift 由融合的 {adapter} 排程決定，h3-ui 不送這兩個欄位",
         "t2va_no_attachments": "t2va 不接受任何附件",
@@ -234,6 +242,41 @@ EST_FIXED = float(setting("H3_EST_FIXED_SECONDS", "0"))
 EST_PER_MPXS = float(setting("H3_EST_PER_MPXS", "11.88"))
 EST_PER_MPXS_STEP = float(setting("H3_EST_PER_MPXS_STEP", "6.05"))
 EST_PER_MPXS2_STEP = float(setting("H3_EST_PER_MPXS2_STEP", "0.88"))
+
+
+def request_lora():
+    """A LoRA the server preloaded and each request may switch on.
+
+    This is the other kind of adapter, and it is the opposite of a fused one.
+    vLLM-Omni's --lora-path with --lora-backend peft keeps the adapter resident
+    but inactive; a request carrying a `lora` field activates it, and one
+    without renders on the base checkpoint. So it is a per-request choice
+    rather than a property of the server, which is what makes a checkbox
+    honest here and dishonest for FastH3.
+
+    The adapter dictates its own sampling settings. The Turbo release wants
+    five sigma points, which bound its four denoiser evaluations, and a video
+    shift of 6 rather than the checkpoint's 12; sending anything else samples
+    the student where it was never distilled.
+    """
+    path = setting("H3_REQUEST_LORA_PATH", "")
+    if not path:
+        return None
+    tasks = [t.strip() for t in setting("H3_REQUEST_LORA_TASKS", "t2va,fl2va").split(",")
+             if t.strip()]
+    return {
+        "name": setting("H3_REQUEST_LORA_NAME", "turbo"),
+        "path": path,
+        "scale": float(setting("H3_REQUEST_LORA_SCALE", "1.0")),
+        "steps": int(setting("H3_REQUEST_LORA_STEPS", "5")),
+        "flow_shift": float(setting("H3_REQUEST_LORA_FLOW_SHIFT", "6")),
+        "audio_flow_shift": float(setting("H3_REQUEST_LORA_AUDIO_SHIFT", "3.0")),
+        "tasks": tasks,
+        "label": setting("H3_REQUEST_LORA_LABEL", "Turbo, 4 denoiser steps"),
+    }
+
+
+REQUEST_LORA = request_lora()
 
 
 def named_ratio(width, height):
@@ -389,12 +432,21 @@ def build_request(params, attachments, lang="en"):
         "seed": params["seed"],
         "fps": params["fps"],
     }
+    # An activated request LoRA brings its own schedule, so it decides the
+    # step count and both shifts rather than the form.
+    if params.get("lora") and REQUEST_LORA:
+        fields["num_inference_steps"] = REQUEST_LORA["steps"]
+        fields["flow_shift"] = REQUEST_LORA["flow_shift"]
+        extra["audio_flow_shift"] = REQUEST_LORA["audio_flow_shift"]
+        fields["lora"] = json.dumps({"name": REQUEST_LORA["name"],
+                                     "path": REQUEST_LORA["path"],
+                                     "scale": REQUEST_LORA["scale"]})
     # A fused schedule owns both shifts: measured against the 2026-08-31 nightly,
     # the server accepts a value only when it equals the checkpoint's own (12 and
     # 3 for FastH3) and answers "FastH3 requires flow_shift=12, got 8" otherwise.
     # Omitting them is always accepted, and it is the only option that cannot
     # disagree with a schedule this process never sees.
-    if not PARTITION["locked_shifts"]:
+    elif not PARTITION["locked_shifts"]:
         fields["flow_shift"] = params["flow_shift"]
         extra["audio_flow_shift"] = params["audio_flow_shift"]
     # t2va on a current build wants a named ratio and refuses to infer one from
@@ -748,6 +800,9 @@ def service_status(lang="en"):
             "locked_shifts": PARTITION["locked_shifts"],
             "adapter": PARTITION["adapter"],
             "contract": SERVER_CONTRACT,
+            "request_lora": ({k: REQUEST_LORA[k] for k in
+                              ("name", "label", "steps", "tasks")}
+                             if REQUEST_LORA else None),
             "duration_min": DURATION_MIN, "duration_max": DURATION_MAX,
             "est": {"fixed": EST_FIXED, "per_mpxs": EST_PER_MPXS,
                     "per_mpxs_step": EST_PER_MPXS_STEP,
@@ -1000,6 +1055,23 @@ class Handler(BaseHTTPRequestHandler):
                             hi=DURATION_MAX)}))
             return
 
+        turbo = bool(payload.get("turbo"))
+        if turbo:
+            if not REQUEST_LORA:
+                self._send(400, json.dumps({"error": t(lang, "turbo_unavailable")}))
+                return
+            if PARTITION["adapter"]:
+                # A fused checkpoint refuses a request that also names a LoRA,
+                # so the two adapters are mutually exclusive by construction.
+                self._send(400, json.dumps(
+                    {"error": t(lang, "turbo_fused", adapter=PARTITION["adapter"])}))
+                return
+            if task not in REQUEST_LORA["tasks"]:
+                self._send(400, json.dumps(
+                    {"error": t(lang, "turbo_task", name=REQUEST_LORA["name"],
+                                task=task, tasks=REQUEST_LORA["tasks"])}))
+                return
+
         try:
             steps = int(payload.get("steps", 20))
         except (TypeError, ValueError):
@@ -1050,6 +1122,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": t(lang, problem)}))
             return
 
+        if turbo:
+            steps = REQUEST_LORA["steps"]
+
         params = {
             "task": task,
             "prompt": prompt,
@@ -1062,7 +1137,12 @@ class Handler(BaseHTTPRequestHandler):
         }
         # The sidecar is {**params, ...}, so recording the adapter and dropping
         # the shifts that were never sent costs one branch each.
-        if PARTITION["locked_shifts"]:
+        if turbo:
+            params["lora"] = {"name": REQUEST_LORA["name"],
+                              "scale": REQUEST_LORA["scale"],
+                              "flow_shift": REQUEST_LORA["flow_shift"],
+                              "audio_flow_shift": REQUEST_LORA["audio_flow_shift"]}
+        elif PARTITION["locked_shifts"]:
             params["adapter"] = PARTITION["adapter"]
         else:
             params["flow_shift"] = float(payload.get("flow_shift", 12))
@@ -1290,6 +1370,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
     </div>
+    <label class="toggle" id="turbo-wrap" style="display:none"><input id="turbo" type="checkbox"><span id="turbo-label"></span></label>
     <label class="toggle"><input id="rand" type="checkbox"><span data-i18n="opt.random"></span></label>
 
     <button id="go" data-i18n="btn.generate"></button>
@@ -1331,6 +1412,8 @@ const STRINGS = {
     "hdr.uierror": "frontend error",
     "hdr.adapter": " · {a}",
     "note.stepslocked": "fixed at {n} by {a}",
+    "opt.turbo": "{label}",
+    "note.turbo": "fixed at {n} by {a}",
     "label.mode": "Mode",
     "opt.structured": "Structured prompt (H3's own format)",
     "note.description": "Framing, action, camera, dialogue, on-scene sound",
@@ -1409,6 +1492,8 @@ const STRINGS = {
     "hdr.uierror": "前端錯誤",
     "hdr.adapter": " · {a}",
     "note.stepslocked": "由 {a} 釘死在 {n} 步",
+    "opt.turbo": "{label}",
+    "note.turbo": "由 {a} 釘死在 {n} 步",
     "label.mode": "生成模式",
     "opt.structured": "結構化 prompt（H3 官方格式）",
     "note.description": "畫面、動作、運鏡、對白、場景內聲音",
@@ -1522,6 +1607,10 @@ let TASKS = ["t2va"];
 // written out twice, once here and once in the server, which is exactly how
 // the two drift apart.
 let EST = {fixed: 0, per_mpxs: 11.88, per_mpxs_step: 6.05, per_mpxs2_step: 0.88};
+let LORA = null, PINNED = 0, LOCKED = false, ADAPTER = null;
+// What the steps box held before the adapter took it over, so unticking gives
+// the number back rather than leaving the adapter's behind.
+let STEPS_BEFORE = null;
 let CONSTRAINTS = "";
 
 function dims() {
@@ -1556,12 +1645,20 @@ $("task").onchange = syncTask;
 // box the user is halfway through editing.
 function applyConstraints(s) {
   const sig = JSON.stringify([s.pinned_steps, s.locked_shifts, s.adapter,
-                              s.est, s.duration_min, s.duration_max]);
+                              s.est, s.duration_min, s.duration_max,
+                              s.request_lora]);
   if (sig === CONSTRAINTS) return;
   CONSTRAINTS = sig;
   if (s.est) EST = s.est;
 
+  // A request-switchable adapter is offered rather than imposed: the checkbox
+  // appears, and syncTurbo() applies its schedule only when it is ticked.
+  LORA = s.request_lora || null;
+  $("turbo-wrap").style.display = LORA ? "flex" : "none";
+  if (LORA) $("turbo-label").textContent = tr("opt.turbo", {label: LORA.label});
+
   const pinned = s.pinned_steps || 0;
+  PINNED = pinned; LOCKED = !!s.locked_shifts; ADAPTER = s.adapter;
   // readOnly, not disabled: a disabled field is not submitted.
   $("steps").readOnly = !!pinned;
   if (pinned) $("steps").value = pinned;
@@ -1582,6 +1679,31 @@ function applyConstraints(s) {
   if (s.duration_max != null) $("duration").max = s.duration_max;
   estimate();
   syncAlignHint();
+  syncTurbo();
+}
+
+// The adapter brings its own schedule, so ticking it locks the same boxes a
+// fused one does. Unticking restores whatever the server allows.
+function syncTurbo() {
+  if (!LORA) return;
+  const on = $("turbo").checked;
+  if (on && STEPS_BEFORE === null) STEPS_BEFORE = $("steps").value;
+  $("steps").readOnly = on || !!PINNED;
+  if (on) {
+    $("steps").value = LORA.steps;
+  } else {
+    if (PINNED) $("steps").value = PINNED;
+    else if (STEPS_BEFORE !== null) $("steps").value = STEPS_BEFORE;
+    STEPS_BEFORE = null;
+  }
+  $("steps-note").textContent = on
+    ? tr("note.turbo", {n: LORA.steps, a: LORA.name})
+    : (PINNED ? tr("note.stepslocked", {n: PINNED, a: ADAPTER || "the checkpoint"}) : "");
+  const hide = on || LOCKED;
+  $("flow-wrap").style.display = hide ? "none" : "block";
+  $("aflow-wrap").style.display = hide ? "none" : "block";
+  $("shift-row").style.gridTemplateColumns = hide ? "1fr" : "";
+  estimate();
 }
 
 function clampDuration() {
@@ -1821,6 +1943,7 @@ function syncAlignHint() {
   el.textContent = tr("align.hint", {shot: last, secs});
 }
 
+$("turbo").onchange = syncTurbo;
 $("structured").onchange = syncStructured;
 $("description").oninput = syncAlignHint;
 
@@ -1863,6 +1986,7 @@ $("go").onclick = async () => {
   // must not send what it is not showing.
   const shifts = $("flow-wrap").style.display === "none" ? {} :
     {flow_shift: +$("flow").value, audio_flow_shift: +$("aflow").value};
+  const turbo = !!(LORA && $("turbo").checked);
 
   $("stat").textContent = tr("stat.sending");
   const res = await api("/api/generate", {
@@ -1870,7 +1994,7 @@ $("go").onclick = async () => {
     body: JSON.stringify({
       task: $("task").value, ...text, width, height,
       steps: +$("steps").value, duration: +$("duration").value,
-      fps: +$("fps").value, ...shifts, seed: +$("seed").value, attachments
+      fps: +$("fps").value, ...shifts, turbo, seed: +$("seed").value, attachments
     })
   });
   const {position, error} = await res.json();

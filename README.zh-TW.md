@@ -69,6 +69,30 @@ h3-ui 講兩種請求契約，由 `H3_SERVER_CONTRACT` 決定。
 啟動。混搭會不對稱地壞掉：融合的那台會直接拒絕 20 步請求，沒有 adapter 的那台則會接受
 4 步請求並回傳糊掉的畫面。
 
+### Turbo，以及另一種 adapter
+
+把蒸餾 adapter 掛到 H3 前面有兩種做法，行為差異大到 h3-ui 必須當成兩個功能處理。
+
+**FastH3 是融合的**，在伺服器啟動時併進 checkpoint，所以它是伺服器的屬性：每個請求都是
+四步、都只有 t2va，沒有東西可以切換。表單會自我鎖定就是這個原因。
+
+**Turbo LoRA 是預載但未啟用。** 伺服器以 `--lora-backend peft --lora-path` 啟動後，
+vLLM-Omni 會讓它常駐但不生效，由每個請求自己決定：指名它就套用，不指名就用原版
+checkpoint 以你要的步數算圖。h3-ui 把這件事做成勾選框，勾了就套用 adapter 自己的取樣設定，
+也就是界出四次去噪的五個 sigma 點，以及 video shift 6 而不是 checkpoint 的 12。
+
+把 `H3_REQUEST_LORA_PATH` 指向伺服器拿到的同一個檔（用伺服器看得到的路徑），勾選框就會出現。
+上游只支援一個檔案：
+
+```
+lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+```
+
+同一個 repo 的 8 步、ComfyUI 格式、Ref2VA 與 v1.1 都不支援，也不支援預先融合或疊多個。
+
+兩者互斥：融合過的伺服器會拒收同時指名 LoRA 的請求，所以 h3-ui 會直接擋下並說明是哪個
+adapter 擋路，而不是讓上游回一個 500。
+
 ### 重新校準時間估算
 
 產生按鈕下方的估算來自一個成本模型，以 `X = 百萬畫素 × 輸出秒數` 表示：
@@ -131,6 +155,14 @@ python3 server.py
 | `H3_UI_PORT` | `8080` | UI 連接埠 |
 | `H3_UI_ENV_FILE` | *(自動)* | 明確指定 `.env` 的路徑 |
 | `H3_SERVER_CONTRACT` | `current` | `current` 或 `legacy`，見「伺服器相容性」 |
+| `H3_REQUEST_LORA_PATH` | *(空)* | 預載的 LoRA，用伺服器看得到的路徑。有值勾選框才會出現 |
+| `H3_REQUEST_LORA_NAME` | `turbo` | 請求 `lora` 欄位裡送的名稱 |
+| `H3_REQUEST_LORA_LABEL` | `Turbo, 4 denoiser steps` | 勾選框文字 |
+| `H3_REQUEST_LORA_STEPS` | `5` | adapter 要的 sigma 點數 |
+| `H3_REQUEST_LORA_FLOW_SHIFT` | `6` | adapter 蒸餾時的 video shift |
+| `H3_REQUEST_LORA_AUDIO_SHIFT` | `3.0` | audio shift |
+| `H3_REQUEST_LORA_SCALE` | `1.0` | LoRA 強度 |
+| `H3_REQUEST_LORA_TASKS` | `t2va,fl2va` | adapter 提供的任務 |
 | `H3_LORA_PATH` | *(空)* | 伺服器啟動時用的 adapter。有值即視為 FastH3 已融合 |
 | `H3_FASTH3` | *(未設定)* | 覆寫：布林開關，或融合的 adapter 釘死的步數。`0` 是強制關閉 |
 | `H3_EST_FIXED_SECONDS` | `0` | 時間估算的常數項 |

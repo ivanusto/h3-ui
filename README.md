@@ -79,6 +79,37 @@ with `--lora-path`. A mixed pair fails asymmetrically: the fused box rejects a
 20 step request outright, while a box without the adapter accepts a 4 step
 request and returns mush.
 
+### Turbo, and the other kind of adapter
+
+There are two ways to put a distilled adapter in front of H3, and they behave
+differently enough that h3-ui treats them as different features.
+
+**FastH3 is fused** into the checkpoint when the server starts, so it is a
+property of the server: every request gets four steps and t2va, and there is
+nothing to switch. That is why the form locks itself.
+
+**The Turbo LoRA is preloaded but inactive.** Started with `--lora-backend peft
+--lora-path`, vLLM-Omni keeps it resident and each request decides: name it and
+the adapter runs, omit it and the same server renders on the base checkpoint at
+whatever step count you asked for. h3-ui offers that as a checkbox, and ticking
+it applies the adapter's own sampling settings, five sigma points bounding four
+denoiser evaluations and a video shift of 6 rather than the checkpoint's 12.
+
+Point `H3_REQUEST_LORA_PATH` at the same file the server was given, as the
+server sees it, and the checkbox appears. Only one artifact is supported
+upstream:
+
+```
+lightx2v/Minimax-h3-Turbo/minimax_h3_fl2v_turbo_4step_v1.0_768p_bf16.safetensors
+```
+
+The 8-step, ComfyUI, Ref2VA and v1.1 files from that repo are not, and neither
+is prefusion or composing more than one.
+
+The two are mutually exclusive: a fused server refuses a request that also names
+a LoRA, so h3-ui rejects the combination with a message saying which adapter is
+in the way rather than letting the upstream 500.
+
 ### Recalibrating the time estimate
 
 The hint under the Generate button comes from a cost model, in terms of
@@ -148,6 +179,14 @@ Resolved in order: process environment → `.env` → default.
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
 | `H3_SERVER_CONTRACT` | `current` | `current` or `legacy`; see Server compatibility |
+| `H3_REQUEST_LORA_PATH` | *(empty)* | The preloaded LoRA, as the server sees it. Set means the checkbox appears |
+| `H3_REQUEST_LORA_NAME` | `turbo` | Name sent in the request's `lora` field |
+| `H3_REQUEST_LORA_LABEL` | `Turbo, 4 denoiser steps` | Checkbox text |
+| `H3_REQUEST_LORA_STEPS` | `5` | Sigma points the adapter wants |
+| `H3_REQUEST_LORA_FLOW_SHIFT` | `6` | Video shift the adapter was distilled at |
+| `H3_REQUEST_LORA_AUDIO_SHIFT` | `3.0` | Audio shift |
+| `H3_REQUEST_LORA_SCALE` | `1.0` | LoRA strength |
+| `H3_REQUEST_LORA_TASKS` | `t2va,fl2va` | Tasks the adapter serves |
 | `H3_LORA_PATH` | *(empty)* | The adapter the server was started with. Set means FastH3 is fused |
 | `H3_FASTH3` | *(unset)* | Override: a switch, or the step count the fused adapter pins. `0` forces off |
 | `H3_EST_FIXED_SECONDS` | `0` | Constant term of the time estimate |
