@@ -88,6 +88,7 @@ ZH_HANT = re.compile(r"\bzh[-_](hant|tw|hk|mo)", re.I)
 MESSAGES = {
     "en": {
         "attachment_data_url": "Attachments must be base64 data URLs",
+        "fastvideo_no_reference": "This backend takes text only. Remove the attachment or send it to a vLLM-Omni box.",
         "attachment_decode": "Attachment base64 decode failed: {error}",
         "body_too_large": "Attachments too large (512 MB limit)",
         "duration_number": "duration must be a number",
@@ -122,6 +123,7 @@ MESSAGES = {
     },
     "zh": {
         "attachment_data_url": "附件必須是 base64 data URL",
+        "fastvideo_no_reference": "這個後端只吃文字，請移除附件，或改送到 vLLM-Omni 的機器。",
         "attachment_decode": "附件 base64 解碼失敗: {error}",
         "body_too_large": "附件過大（上限 512 MB）",
         "duration_number": "duration 必須是數字",
@@ -211,6 +213,37 @@ API_BASES = [normalise_base(part)
              if part.strip()]
 API_BASE = API_BASES[0]
 API_KEY = ENV.get("H3_API_KEY", "")
+
+# Which server speaks at each upstream. Two exist now and they are not the same
+# contract, only the same shape: vLLM-Omni takes a multipart body and answers
+# POST /v1/videos/sync with the MP4, and FastVideo's OpenAI compatible server
+# takes JSON at the same path and answers the same way. The queue, the seeds
+# and the sidecar do not care which is which, so the difference is confined to
+# building the body and reading the reply.
+#
+# One value applies to every upstream; a comma separated list assigns them in
+# the order H3_API_BASES lists them, so a box running each is expressible.
+BACKEND_KINDS_VALID = ("vllm-omni", "fastvideo")
+
+
+def backend_kinds():
+    raw = [part.strip().lower() for part in
+           setting("H3_BACKEND_KIND", "vllm-omni").split(",") if part.strip()]
+    if len(raw) == 1:
+        raw *= len(API_BASES)
+    kinds = {}
+    for index, base in enumerate(API_BASES):
+        kind = raw[index] if index < len(raw) else "vllm-omni"
+        kinds[base] = kind if kind in BACKEND_KINDS_VALID else "vllm-omni"
+    return kinds
+
+
+BACKEND_KIND = backend_kinds()
+
+# The model alias FastVideo advertises. Its server rejects a request naming any
+# other model, and the alias is an operator choice rather than a checkpoint
+# property, so it has to be configurable.
+FASTVIDEO_MODEL = setting("H3_FASTVIDEO_MODEL", "fasth3")
 
 # Which request contract the upstream speaks. "current" is what vLLM-Omni has
 # wanted since the 2026-08-22 nightly: t2va needs a named aspect ratio, and the
@@ -423,6 +456,55 @@ def encode_multipart(fields, files):
     return bytes(body), f"multipart/form-data; boundary={boundary}"
 
 
+def build_fastvideo_request(params, attachments, lang="en"):
+    """Translate UI parameters into FastVideo's OpenAI compatible video request.
+
+    Four differences from the vLLM-Omni body matter. The transport is JSON
+    rather than multipart. Frames are named directly instead of being derived
+    from a duration, because FastH3 only accepts counts on its causal VAE grid
+    and rounding a duration into one behind the caller's back would silently
+    change what was measured. Neither shift is ever sent: the released
+    checkpoint owns its five point schedule, and a request naming a shift is
+    refused rather than ignored.
+
+    And num_inference_steps counts something else here. Both servers run the
+    same distilled schedule, five sigma points bounding four denoiser
+    evaluations, but vLLM-Omni names the four and FastVideo names the five. So
+    the same render is steps=4 on one and steps=5 on the other, and neither is
+    wrong. The number is passed through as given rather than translated, so a
+    sidecar always records what was actually sent.
+
+    Reference media would ride along as image_reference here. Nothing needs it
+    yet, so an attachment is refused rather than dropped quietly.
+    """
+    if any(attachments.get(key) for key in ("image", "audio", "videos")):
+        raise ValueError(t(lang, "fastvideo_no_reference"))
+    body = {
+        "model": FASTVIDEO_MODEL,
+        "prompt": params["prompt"],
+        "seed": params["seed"],
+        "num_inference_steps": params["steps"],
+        "guidance_scale": 1.0,
+        "video_params": {"fps": params["fps"],
+                         "num_frames": frame_count(params["duration"],
+                                                   params["fps"])},
+    }
+    if params.get("width") and params.get("height"):
+        body["size"] = f"{params['width']}x{params['height']}"
+    return json.dumps(body).encode(), "application/json"
+
+
+def frame_count(duration, fps):
+    """Frames for a duration, snapped up to MiniMax H3's 17n+5 grid.
+
+    Both servers land on that grid. vLLM-Omni snaps for you and reports the
+    count it used; FastVideo rejects anything off grid. Snapping here means the
+    number in the sidecar is the number that was rendered either way.
+    """
+    raw = max(int(round(float(duration) * float(fps))), 5)
+    return raw + (5 - raw) % 17
+
+
 def build_request(params, attachments, lang="en"):
     """Translate UI parameters into the vLLM-Omni video request."""
     extra = {"task": params["task"], "duration": params["duration"]}
@@ -485,6 +567,40 @@ def build_request(params, attachments, lang="en"):
     return fields, files
 
 
+def server_metrics(headers):
+    """What the server measured about its own run, from the reply headers.
+
+    Both servers send the same three: inference time, a per stage breakdown, and
+    the peak memory the worker saw. FastVideo copied vLLM-Omni's contract here,
+    header names included, which is what makes a stage by stage comparison
+    across the two possible at all.
+
+    The peak memory one is the only trustworthy memory figure on this hardware.
+    Unified memory makes nvidia-smi report N/A, and the system used figure
+    counts the page cache, so a number measured inside the worker is the only
+    one that means what it says.
+
+    An older build may send none of them. An empty result is that, not a
+    failure, so it is recorded as absent rather than as zero.
+    """
+    found = {}
+    for header, key in (("X-Inference-Time-S", "inference_seconds"),
+                        ("X-Peak-Memory-MB", "peak_memory_mb")):
+        raw = headers.get(header)
+        if raw:
+            try:
+                found[key] = float(raw)
+            except ValueError:
+                found[key] = raw
+    stages = headers.get("X-Stage-Durations")
+    if stages:
+        try:
+            found["stages"] = json.loads(stages)
+        except json.JSONDecodeError:
+            found["stages"] = stages
+    return found
+
+
 def run_job(job_id, params, attachments, lang="en", api_base=None):
     """Run one generation to completion. Called only by a queue worker.
 
@@ -502,13 +618,17 @@ def run_job(job_id, params, attachments, lang="en", api_base=None):
                 JOBS[job_id].update(kw)
 
     started = time.time()
-    touch(state="running", started=started, backend=api_base)
+    kind = BACKEND_KIND.get(api_base, "vllm-omni")
+    touch(state="running", started=started, backend=api_base, backend_kind=kind)
     try:
-        fields, files = build_request(params, attachments, lang)
+        if kind == "fastvideo":
+            body, content_type = build_fastvideo_request(params, attachments, lang)
+        else:
+            fields, files = build_request(params, attachments, lang)
+            body, content_type = encode_multipart(fields, files)
     except ValueError as exc:
         touch(state="failed", error=str(exc), elapsed=0)
         return
-    body, content_type = encode_multipart(fields, files)
     request = urllib.request.Request(
         f"{api_base}/v1/videos/sync", data=body,
         headers={"Content-Type": content_type, **auth_headers()},
@@ -516,7 +636,8 @@ def run_job(job_id, params, attachments, lang="en", api_base=None):
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
             payload = response.read()
-            kind = response.headers.get("Content-Type", "")
+            content_kind = response.headers.get("Content-Type", "")
+            metrics = server_metrics(response.headers)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:1200]
         touch(state="failed", error=f"HTTP {exc.code}: {detail}",
@@ -528,9 +649,9 @@ def run_job(job_id, params, attachments, lang="en", api_base=None):
         return
 
     elapsed = time.time() - started
-    if "video" not in kind and not payload.startswith(b"\x00\x00\x00"):
+    if "video" not in content_kind and not payload.startswith(b"\x00\x00\x00"):
         touch(state="failed", elapsed=elapsed,
-              error=f"non-video response ({kind}): "
+              error=f"non-video response ({content_kind}): "
                     f"{payload[:1200].decode('utf-8', 'replace')}")
         return
 
@@ -539,6 +660,8 @@ def run_job(job_id, params, attachments, lang="en", api_base=None):
     (MEDIA / name).write_bytes(payload)
     (MEDIA / (name + ".json")).write_text(
         json.dumps({**params, "elapsed": elapsed, "file": name,
+                    "backend": api_base, "backend_kind": kind,
+                    **({"server_metrics": metrics} if metrics else {}),
                     "attached": sorted(k for k, v in attachments.items() if v)},
                    indent=2, ensure_ascii=False))
     touch(state="done", elapsed=elapsed, file=name, size=len(payload))
@@ -748,7 +871,28 @@ STATUS_CACHE = {base: {"online": None, "model": None, "detail": None,
 
 
 def probe_upstream(api_base):
-    """One /v1/models call. Returns (ok, model_id or None, detail or None)."""
+    """Ask one upstream whether it is usable. Returns (ok, model, detail).
+
+    /v1/models is the portable question and the only one vLLM-Omni answers
+    usefully, but it only proves the HTTP layer is up. That distinction is not
+    academic here: a vLLM-Omni whose result pump thread has died keeps
+    answering both /health and /v1/models with a 200 while no generation ever
+    returns again, which is the failure this frontend cannot see and cannot
+    work around.
+
+    FastVideo's /health is the better question, because it verifies the engine
+    is open and every worker is alive and answers 503 when the pool is not
+    usable. Where it is on offer, ask it first, so a dead engine reads as
+    offline instead of as a box that is merely slow.
+    """
+    if BACKEND_KIND.get(api_base) == "fastvideo":
+        request = urllib.request.Request(f"{api_base}/health",
+                                         headers=auth_headers())
+        try:
+            with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
+                response.read()
+        except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
+            return False, None, f"{type(exc).__name__}: {exc}"
     request = urllib.request.Request(f"{api_base}/v1/models", headers=auth_headers())
     try:
         with urllib.request.urlopen(request, timeout=PROBE_TIMEOUT) as response:
