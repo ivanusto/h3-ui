@@ -1406,6 +1406,15 @@ INDEX_HTML = r"""<!doctype html>
   .card video { max-height: 170px; object-fit: contain; }
   .meta { font-size: 12px; color: var(--muted); margin-top: 10px;
     font-family: ui-monospace, monospace; }
+  .sidecar { margin-top: 10px; }
+  .sidecar summary { font-size: 12px; color: var(--muted); cursor: pointer;
+    user-select: none; }
+  .sidecar pre { font-family: ui-monospace, monospace; font-size: 12px;
+    line-height: 1.55; margin: 8px 0 0; padding: 12px 14px; overflow-x: auto;
+    border: 1px solid var(--line); border-radius: 8px; background: #0d0f14; }
+  .sidecar button { font: inherit; font-size: 12px; margin-left: 10px;
+    padding: 2px 9px; border: 1px solid var(--line); border-radius: 6px;
+    background: transparent; color: var(--muted); cursor: pointer; }
   .hist { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
     gap: 14px; margin-top: 14px; }
   .card { border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
@@ -1602,6 +1611,10 @@ const STRINGS = {
     "del.confirm": "Delete {file}?\nThe video and its parameter file go together, and there is no undo.",
     "del.failed": "Delete failed",
     "link.download": "Download",
+    "sidecar.title": "Reproduction record",
+    "sidecar.copy": "Copy",
+    "sidecar.copied": "Copied",
+    "sidecar.missing": "No sidecar was written beside this file.",
     "link.delete": "Delete",
     "state.queued": "queued",
     "state.running": "running",
@@ -1682,6 +1695,10 @@ const STRINGS = {
     "del.confirm": "刪除 {file} ？\n影片與參數檔會一起移除，無法復原。",
     "del.failed": "刪除失敗",
     "link.download": "下載",
+    "sidecar.title": "重現紀錄",
+    "sidecar.copy": "複製",
+    "sidecar.copied": "已複製",
+    "sidecar.missing": "這個檔案旁邊沒有參數紀錄。",
     "link.delete": "刪除",
     "state.queued": "排隊中",
     "state.running": "生成中",
@@ -1958,11 +1975,55 @@ async function delMedia(file) {
 }
 loadHistory();
 
-function show(file) {
+// Open one clip straight from the address bar. A render worth talking about is
+// worth linking to, and the link has to carry the reproduction record with it
+// rather than an instruction to go and find the right card.
+if (location.hash.startsWith("#file=")) {
+  const wanted = decodeURIComponent(location.hash.slice("#file=".length));
+  if (/^[A-Za-z0-9._-]+$/.test(wanted)) show(wanted, true);
+}
+
+// The sidecar is the point of the sidecar: a clip is only reproducible if the
+// numbers that produced it are in front of you when you decide you want it
+// again. Reading it meant opening a file on the server before this, which is
+// exactly the friction that stops anyone doing it.
+async function show(file, deep) {
   shownFile = file;
   $("out").innerHTML = `<video src="/media/${file}" controls autoplay></video>
     <p class="meta">${file} · <a href="/media/${file}" download>${tr("link.download")}</a> ·
-      <a href="#" onclick="delMedia('${file}');return false">${tr("link.delete")}</a></p>`;
+      <a href="#" onclick="delMedia('${file}');return false">${tr("link.delete")}</a></p>
+    <details class="sidecar" id="sidecar"${deep ? " open" : ""}></details>`;
+  let text;
+  try {
+    const r = await api("/media/" + encodeURIComponent(file) + ".json");
+    if (!r.ok) throw new Error(r.status);
+    text = JSON.stringify(await r.json(), null, 2);
+  } catch (e) {
+    text = null;
+  }
+  // A late arrival must not overwrite a clip the reader has since moved on to.
+  if (shownFile !== file) return;
+  const panel = $("sidecar");
+  if (!panel) return;
+  if (text === null) {
+    panel.innerHTML = `<summary>${tr("sidecar.title")}</summary>
+      <p class="meta">${tr("sidecar.missing")}</p>`;
+    return;
+  }
+  panel.innerHTML = `<summary>${tr("sidecar.title")}
+      <button onclick="copySidecar(event)">${tr("sidecar.copy")}</button>
+    </summary><pre>${esc(text)}</pre>`;
+}
+
+function copySidecar(ev) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  const pre = $("sidecar").querySelector("pre");
+  if (!pre) return;
+  navigator.clipboard.writeText(pre.textContent).then(() => {
+    ev.target.textContent = tr("sidecar.copied");
+    setTimeout(() => { ev.target.textContent = tr("sidecar.copy"); }, 1600);
+  });
 }
 
 const esc = s => (s || "").replace(/[&<>"]/g, c =>
