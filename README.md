@@ -179,6 +179,8 @@ Resolved in order: process environment → `.env` → default.
 | `H3_UI_PORT` | `8080` | UI port |
 | `H3_UI_ENV_FILE` | *(auto)* | Explicit path to a `.env` |
 | `H3_SERVER_CONTRACT` | `current` | `current` or `legacy`; see Server compatibility |
+| `H3_BACKEND_KIND` | `vllm-omni` | Which server each upstream runs: `vllm-omni` or `fastvideo`. One value covers every upstream; a comma separated list assigns them in `H3_API_BASES` order |
+| `H3_FASTVIDEO_MODEL` | `fasth3` | The model alias a FastVideo upstream advertises. It rejects a request naming any other |
 | `H3_REQUEST_LORA_PATH` | *(empty)* | The preloaded LoRA, as the server sees it. Set means the checkbox appears |
 | `H3_REQUEST_LORA_NAME` | `turbo` | Name sent in the request's `lora` field |
 | `H3_REQUEST_LORA_LABEL` | `Turbo, 4 denoiser steps` | Checkbox text |
@@ -353,9 +355,13 @@ media/          generated videos and their sidecar JSON (gitignored)
 
 ## A note on long generations
 
-vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which upstream sets to 30 s. If a single denoise step runs longer than that, the output future is cancelled and the server's result-pump thread dies, after which `/health` keeps answering 200 while no request ever returns again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44 to 48 s per step on the box this was written against.
+vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUTPUT_TIMEOUT`, which it used to hardcode at 30 s. If a single denoise step ran longer than that, the output future was cancelled and the server's result-pump thread died, after which `/health` kept answering 200 while no request ever returned again. High step counts on long durations reach that easily: 50 steps at 4 s ran 44 to 48 s per step on the box this was written against.
 
-Reported as [vllm-project/vllm-omni#5821](https://github.com/vllm-project/vllm-omni/issues/5821), with a build-time fix in [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4). Worth patching before you push step counts up; this frontend can't work around it.
+**The timeout half is fixed upstream.** [#6255](https://github.com/vllm-project/vllm-omni/pull/6255) merged on 2026-08-22: the bound is now `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT`, defaulting to 600 s. Any nightly from that date on already has it, and the build-time workaround in [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4) is no longer needed. Check what your image actually reads before setting anything: a workaround's environment variable keeps being accepted long after nothing looks at it.
+
+**The health-check half is not fixed.** A dead pump still reports as a healthy server, because `check_health()` does not look at the pump thread. [#6253](https://github.com/vllm-project/vllm-omni/pull/6253) adds that check along with per-request fault containment, and is still open. Until it lands, a process-level probe against vLLM-Omni cannot tell a wedged engine from a slow one, and neither can this frontend.
+
+The original report, [#5821](https://github.com/vllm-project/vllm-omni/issues/5821), was closed as a duplicate of [#5793](https://github.com/vllm-project/vllm-omni/issues/5793), which was filed 13 hours earlier with the same root cause. That call was correct.
 
 ## License
 

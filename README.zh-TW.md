@@ -155,6 +155,8 @@ python3 server.py
 | `H3_UI_PORT` | `8080` | UI 連接埠 |
 | `H3_UI_ENV_FILE` | *(自動)* | 明確指定 `.env` 的路徑 |
 | `H3_SERVER_CONTRACT` | `current` | `current` 或 `legacy`，見「伺服器相容性」 |
+| `H3_BACKEND_KIND` | `vllm-omni` | 每個上游跑的是哪種伺服器：`vllm-omni` 或 `fastvideo`。給一個值就套用到全部；給逗號清單則依 `H3_API_BASES` 的順序對應 |
+| `H3_FASTVIDEO_MODEL` | `fasth3` | FastVideo 上游對外宣告的模型別名。請求指名其他模型會被拒絕 |
 | `H3_REQUEST_LORA_PATH` | *(空)* | 預載的 LoRA，用伺服器看得到的路徑。有值勾選框才會出現 |
 | `H3_REQUEST_LORA_NAME` | `turbo` | 請求 `lora` 欄位裡送的名稱 |
 | `H3_REQUEST_LORA_LABEL` | `Turbo, 4 denoiser steps` | 勾選框文字 |
@@ -317,9 +319,13 @@ media/          生成的影片與它們的參數 JSON（已 gitignore）
 
 ## 關於長時間生成
 
-vLLM-Omni 用 `_ASYNC_OUTPUT_TIMEOUT` 限制等待某一步背景複製完成的時間，上游把它設成 30 秒。如果單一 denoise 步驟跑得比這久，輸出的 future 會被取消，伺服器的 result-pump 執行緒會死掉，之後 `/health` 還是回 200，但再也不會有任何請求回來。長秒數配高 step 數很容易踩到：在寫這份東西的機器上，50 steps、4 秒的組合每步要跑 44 到 48 秒。
+vLLM-Omni 用 `_ASYNC_OUTPUT_TIMEOUT` 限制等待某一步背景複製完成的時間，上游原本把它寫死成 30 秒。如果單一 denoise 步驟跑得比這久，輸出的 future 會被取消，伺服器的 result-pump 執行緒會死掉，之後 `/health` 還是回 200，但再也不會有任何請求回來。長秒數配高 step 數很容易踩到：在寫這份東西的機器上，50 steps、4 秒的組合每步要跑 44 到 48 秒。
 
-已回報為 [vllm-project/vllm-omni#5821](https://github.com/vllm-project/vllm-omni/issues/5821)，build 階段的修法在 [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4)。把 step 數往上調之前值得先修掉；這個前端沒辦法繞過它。
+**逾時這一半上游已經修好。** [#6255](https://github.com/vllm-project/vllm-omni/pull/6255) 在 2026-08-22 合併，上限改成讀 `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT`，預設 600 秒。那天之後的 nightly 都已經帶著，[joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4) 的 build 階段繞路不再需要。設任何東西之前先確認你的 image 實際讀哪個變數：繞路用的環境變數在沒有人讀它之後，還是會被乖乖收下。
+
+**健康檢查那一半還沒修。** pump 死掉的伺服器至今仍會回報健康，因為 `check_health()` 不看 pump 執行緒。[#6253](https://github.com/vllm-project/vllm-omni/pull/6253) 補上這個檢查與逐請求的故障隔離，目前仍是 open。在它進去之前，行程層級的探測分不出卡死的引擎與只是很慢的引擎，這個前端也分不出。
+
+最早的回報 [#5821](https://github.com/vllm-project/vllm-omni/issues/5821) 被判為 [#5793](https://github.com/vllm-project/vllm-omni/issues/5793) 的重複而關閉，後者早 13 小時提出且根因相同。那個判定是對的。
 
 ## 授權
 
