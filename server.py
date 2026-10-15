@@ -12,17 +12,23 @@ code change. Standard library only.
 
 import base64
 import binascii
+import collections
+import hashlib
 import json
 import mimetypes
 import os
-import queue
 import random
 import re
+import shutil
+import sys
 import threading
+import traceback
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -120,6 +126,19 @@ MESSAGES = {
             "{adapter} is fused on this server, which only serves {tasks}",
         "task_unsupported":
             "The loaded checkpoint ({partition}) only supports {tasks}",
+        "attachment_unknown": "Unknown attachment field: {name}",
+        "attachment_shape": "attachments must be an object, and videos a list",
+        "body_json_object": "The request body must be a JSON object",
+        "body_length": "Content-Length must be a whole number of bytes",
+        "content_type": "Send the request body as application/json",
+        "cross_origin": "Cross-origin requests are refused",
+        "param_positive": "{name} must be a positive whole number",
+        "no_upstream":
+            "No configured upstream can serve this job: {reason}",
+        "shift_number": "flow_shift and audio_flow_shift must be numbers",
+        "reason_fastvideo":
+            "FastVideo takes t2va only, without the request LoRA, between "
+            "{lo} and {hi} seconds",
     },
     "zh": {
         "attachment_data_url": "附件必須是 base64 data URL",
@@ -144,6 +163,16 @@ MESSAGES = {
         "t2va_no_attachments": "t2va 不接受任何附件",
         "task_adapter": "這台伺服器已融合 {adapter}，只提供 {tasks}",
         "task_unsupported": "目前 checkpoint（{partition}）只支援 {tasks}",
+        "attachment_unknown": "不認得的附件欄位：{name}",
+        "attachment_shape": "attachments 必須是物件，videos 必須是陣列",
+        "body_json_object": "請求內容必須是 JSON 物件",
+        "body_length": "Content-Length 必須是整數位元組數",
+        "content_type": "請以 application/json 送出請求內容",
+        "cross_origin": "拒絕跨來源請求",
+        "param_positive": "{name} 必須是正整數",
+        "no_upstream": "目前設定的上游都無法執行這個工作：{reason}",
+        "shift_number": "flow_shift 與 audio_flow_shift 必須是數字",
+        "reason_fastvideo": "FastVideo 只接 t2va、不能搭配請求 LoRA，秒數需介於 {lo} 到 {hi} 秒",
     },
 }
 
@@ -168,7 +197,7 @@ def t(lang, key, **kw):
 def load_env():
     values = {}
     if ENV_FILE.is_file():
-        for line in ENV_FILE.read_text().splitlines():
+        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
@@ -211,8 +240,7 @@ API_BASES = [normalise_base(part)
                                  setting("H3_API_BASE",
                                          "http://127.0.0.1:8000")).split(",")
              if part.strip()]
-API_BASE = API_BASES[0]
-API_KEY = ENV.get("H3_API_KEY", "")
+API_KEY = setting("H3_API_KEY", "")
 
 # Which server speaks at each upstream. Two exist now and they are not the same
 # contract, only the same shape: vLLM-Omni takes a multipart body and answers
@@ -239,23 +267,48 @@ def backend_kinds():
 
 
 BACKEND_KIND = backend_kinds()
+KINDS_PRESENT = set(BACKEND_KIND.values())
 
 # The model alias FastVideo advertises. Its server rejects a request naming any
 # other model, and the alias is an operator choice rather than a checkpoint
 # property, so it has to be configurable.
 FASTVIDEO_MODEL = setting("H3_FASTVIDEO_MODEL", "fasth3")
 
-# Which request contract the upstream speaks. "current" is what vLLM-Omni has
-# wanted since the 2026-08-22 nightly: t2va needs a named aspect ratio, and the
-# clip has to be at least four seconds. "legacy" is the minimax-h3 image
-# published on 2026-08-02, where the canvas alone was enough and nothing
-# bounded the duration from below.
-# Anything that is not the word "legacy" is treated as current, because that is
-# the safe direction to guess in: sending a named ratio to the old image is
-# ignored, while omitting one on a current server fails the request.
-SERVER_CONTRACT = "legacy" if setting(
-    "H3_SERVER_CONTRACT", "current").strip().lower() == "legacy" else "current"
-DURATION_MIN, DURATION_MAX = (0.5, 60.0) if SERVER_CONTRACT == "legacy" else (4.0, 15.0)
+# Which request contract a vLLM-Omni upstream speaks. Three exist:
+#
+# "current" is v0.30.0 on. vllm-omni#7219 (merged 2026-09-24) made
+# num_inference_steps count denoiser evaluations: N steps used to build N sigma
+# points and so run N-1 forwards, and now build N+1 and run N. Turbo's check
+# moved with it, so the 4 step adapter now wants 4 where it wanted 5.
+#
+# "2026-08" is the 2026-08-22 nightly through v0.29.x: t2va needs a named
+# aspect ratio and the clip has to be four to fifteen seconds, but steps still
+# count sigma points.
+#
+# "legacy" is the minimax-h3 image published on 2026-08-02, where the canvas
+# alone was enough and nothing bounded the duration from below. It counts
+# sigma points too.
+#
+# Anything unrecognised is treated as current, because that is the safe
+# direction to guess in: sending a named ratio to an old image is ignored,
+# while omitting one on a current server fails the request.
+SERVER_CONTRACTS = ("current", "2026-08", "legacy")
+SERVER_CONTRACT = setting("H3_SERVER_CONTRACT", "current").strip().lower()
+if SERVER_CONTRACT not in SERVER_CONTRACTS:
+    SERVER_CONTRACT = "current"
+STEPS_COUNT_SIGMA_POINTS = SERVER_CONTRACT != "current"
+VLLM_DURATION = (0.5, 60.0) if SERVER_CONTRACT == "legacy" else (4.0, 15.0)
+
+# FastVideo bounds the clip by frames on H3's 17n+5 grid, 124 to 362 at 24 fps.
+# 4.5 s is the shortest duration that rounds onto 124 rather than 107, which it
+# refuses; 15 s lands on 362, which it accepts since 2026-09-14.
+FASTVIDEO_DURATION = (4.5, 15.0)
+DURATION_BY_KIND = {"vllm-omni": VLLM_DURATION, "fastvideo": FASTVIDEO_DURATION}
+
+# The form's bounds are the union over the configured boxes. A duration only one
+# kind accepts is still valid; the queue just routes it to that kind.
+DURATION_MIN = min(DURATION_BY_KIND[kind][0] for kind in KINDS_PRESENT)
+DURATION_MAX = max(DURATION_BY_KIND[kind][1] for kind in KINDS_PRESENT)
 
 # The named ratios t2va accepts. width and height still set the canvas; the
 # ratio is a separate named field the server refuses to infer, so the nearest
@@ -264,9 +317,12 @@ DURATION_MIN, DURATION_MAX = (0.5, 60.0) if SERVER_CONTRACT == "legacy" else (4.
 NAMED_RATIOS = (("21:9", 21 / 9), ("16:9", 16 / 9), ("4:3", 4 / 3),
                 ("1:1", 1.0), ("3:4", 3 / 4), ("9:16", 9 / 16))
 
-# FastH3's five sigma points bound four denoiser evaluations. Only used as the
-# default when H3_FASTH3 is a bare switch; an integer there wins.
-FASTH3_STEPS = 4
+# FastH3's five sigma points bound four denoiser evaluations. vLLM-Omni names
+# the four and FastVideo names the five, and #7219 left fused and checkpoint
+# schedules alone, so that holds on every contract. Only used as the default
+# when H3_FASTH3 is a bare switch; an integer there wins, which is how the
+# eight step V2 student is expressed: 8 on vLLM-Omni, 9 on FastVideo.
+FASTH3_STEPS = 5 if KINDS_PRESENT == {"fastvideo"} else 4
 
 # The fit found no constant term worth keeping: forcing it to zero was better
 # held out than fitting it, so this ships as 0 and is here for a deployment
@@ -275,6 +331,37 @@ EST_FIXED = float(setting("H3_EST_FIXED_SECONDS", "0"))
 EST_PER_MPXS = float(setting("H3_EST_PER_MPXS", "11.88"))
 EST_PER_MPXS_STEP = float(setting("H3_EST_PER_MPXS_STEP", "6.05"))
 EST_PER_MPXS2_STEP = float(setting("H3_EST_PER_MPXS2_STEP", "0.88"))
+
+
+# The LightX2V Turbo filename names its own sampling policy, and vLLM-Omni reads
+# it from there (vllm-omni#7062): task family, denoiser forwards and whether it
+# is a 768p retrain. The pattern is upstream's, so a file it would refuse, such
+# as a ComfyUI or fp8 export, falls back to configuration here as well.
+TURBO_NAME = re.compile(
+    r"minimax_h3_(?P<task>fl2v|ref2v)_turbo_(?P<steps>\d+)step"
+    r"_v(?P<version>\d+\.\d+)(?P<res>_768p)?(?:_bf16)?\.safetensors")
+
+
+def turbo_spec(path):
+    """What a Turbo filename says about its schedule, or None.
+
+    The 768p retrains moved to a video shift of 6; the 544p artifacts keep the
+    checkpoint's 12. Audio stays at 3 for all of them. An fl2v file serves t2va
+    and fl2va, and a ref2v file serves ref2va only, on a server started with
+    --task-type ref2va.
+    """
+    match = TURBO_NAME.fullmatch(Path(path).name)
+    if not match:
+        return None
+    forwards = int(match.group("steps"))
+    family = match.group("task")
+    return {
+        "forwards": forwards,
+        "version": match.group("version"),
+        "flow_shift": 6.0 if match.group("res") else 12.0,
+        "audio_flow_shift": 3.0,
+        "tasks": ["ref2va"] if family == "ref2v" else ["t2va", "fl2va"],
+    }
 
 
 def request_lora():
@@ -287,25 +374,38 @@ def request_lora():
     rather than a property of the server, which is what makes a checkbox
     honest here and dishonest for FastH3.
 
-    The adapter dictates its own sampling settings. The Turbo release wants
-    five sigma points, which bound its four denoiser evaluations, and a video
-    shift of 6 rather than the checkpoint's 12; sending anything else samples
-    the student where it was never distilled.
+    The adapter dictates its own sampling settings, and the filename says what
+    they are. Sending anything else samples the student where it was never
+    distilled, so the server refuses it. The step count is the one setting that
+    depends on the server as well: a 4 step adapter is steps=4 on a current
+    build and steps=5 on one that still counts sigma points.
+
+    Anything set explicitly wins over the filename, so a deployment that
+    pinned these by hand keeps exactly what it had.
     """
     path = setting("H3_REQUEST_LORA_PATH", "")
     if not path:
         return None
-    tasks = [t.strip() for t in setting("H3_REQUEST_LORA_TASKS", "t2va,fl2va").split(",")
+    spec = turbo_spec(path) or {"forwards": 4, "version": None,
+                                "flow_shift": 6.0, "audio_flow_shift": 3.0,
+                                "tasks": ["t2va", "fl2va"]}
+    steps = spec["forwards"] + (1 if STEPS_COUNT_SIGMA_POINTS else 0)
+    tasks = [t.strip() for t in
+             setting("H3_REQUEST_LORA_TASKS", ",".join(spec["tasks"])).split(",")
              if t.strip()]
+    version = f" v{spec['version']}" if spec["version"] else ""
     return {
         "name": setting("H3_REQUEST_LORA_NAME", "turbo"),
         "path": path,
         "scale": float(setting("H3_REQUEST_LORA_SCALE", "1.0")),
-        "steps": int(setting("H3_REQUEST_LORA_STEPS", "5")),
-        "flow_shift": float(setting("H3_REQUEST_LORA_FLOW_SHIFT", "6")),
-        "audio_flow_shift": float(setting("H3_REQUEST_LORA_AUDIO_SHIFT", "3.0")),
+        "steps": int(setting("H3_REQUEST_LORA_STEPS", str(steps))),
+        "flow_shift": float(setting("H3_REQUEST_LORA_FLOW_SHIFT",
+                                    str(spec["flow_shift"]))),
+        "audio_flow_shift": float(setting("H3_REQUEST_LORA_AUDIO_SHIFT",
+                                          str(spec["audio_flow_shift"]))),
         "tasks": tasks,
-        "label": setting("H3_REQUEST_LORA_LABEL", "Turbo, 4 denoiser steps"),
+        "label": setting("H3_REQUEST_LORA_LABEL",
+                         f"Turbo{version}, {spec['forwards']} denoiser steps"),
     }
 
 
@@ -324,8 +424,8 @@ def fasth3_steps(value):
     """H3_FASTH3 read as a switch or as a step count.
 
     None when unset, 0 when explicitly off, otherwise the step count the fused
-    adapter pins. The integer form is what saves this if FastVideo ships a two
-    or eight step student later.
+    adapter pins. The integer form is what covers a student with a different
+    count, such as FastH3 8-Step V2.
     """
     if value is None or value == "":
         return None
@@ -370,17 +470,49 @@ def adapter_label(path):
     return f"fasth3 ({variant})" if variant else "fasth3"
 
 
+def fastvideo_contract(model_dir):
+    """The schedule a FastVideo release declares, as (forwards, label), or None.
+
+    FastVideo's distilled checkpoints carry no _minimax_h3 block. They ship
+    fastvideo_inference.json instead, and both servers refuse a step count
+    other than the one it names: FastH3 8-Step V2 runs eight forwards, and the
+    V1 DataFree repos four. The file counts in either unit depending on its
+    age, so the forwards are read from whichever field is present, most
+    explicit first.
+    """
+    path = Path(model_dir) / "fastvideo_inference.json"
+    try:
+        meta = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(meta, dict) or meta.get("schema_version") != \
+            "fasth3-inference-contract-v1":
+        return None
+    forwards = meta.get("transformer_forwards")
+    if not isinstance(forwards, int):
+        ladder = meta.get("dmd_denoising_steps")
+        points = meta.get("num_inference_steps")
+        forwards = (len(ladder) if isinstance(ladder, list) and ladder
+                    else points - 1 if isinstance(points, int) and points > 1
+                    else None)
+    if not forwards:
+        return None
+    label = "FastH3 V2" if forwards == 8 else "FastH3"
+    return forwards, f"{label} ({forwards} step)"
+
+
 def load_partition():
     """The served checkpoint's partition, task list and pinned schedule.
 
-    Two different things can pin the step count. A distilled checkpoint says so
-    in its own metadata and the server pins the count from there. A FastH3
-    adapter fused with --lora-path says nothing at all: /v1/models is unchanged
-    and so is model_index.json, so that one can only come from configuration.
+    Three different things can pin the step count. A distilled checkpoint says
+    so in its own metadata and the server pins the count from there. A FastVideo
+    release says so in fastvideo_inference.json instead. A FastH3 adapter fused
+    with --lora-path says nothing at all: /v1/models is unchanged and so is
+    model_index.json, so that one can only come from configuration.
     """
     info = {"partition": "unknown", "tasks": ["t2va"],
             "pinned_steps": None, "locked_shifts": False, "adapter": None}
-    model_dir = ENV.get("MINIMAX_H3_MODEL_DIR", "")
+    model_dir = setting("MINIMAX_H3_MODEL_DIR", "")
     index = Path(model_dir) / "model_index.json" if model_dir else None
     if index and index.is_file():
         meta = json.loads(index.read_text(encoding="utf-8")).get("_minimax_h3", {})
@@ -390,15 +522,27 @@ def load_partition():
         if pinned:
             info.update(pinned_steps=pinned, locked_shifts=True,
                         adapter="a distilled checkpoint")
+    contract = fastvideo_contract(model_dir) if model_dir else None
+    if contract and not info["pinned_steps"]:
+        # The same release is steps=8 to vLLM-Omni and steps=9 to FastVideo.
+        # The number is sent as given, so it has to be the one this fleet's
+        # servers want; a mixed fleet is warned about at startup.
+        forwards, label = contract
+        steps = forwards + 1 if KINDS_PRESENT == {"fastvideo"} else forwards
+        info.update(pinned_steps=steps, locked_shifts=True, tasks=["t2va"],
+                    adapter=label)
+        if info["partition"] == "unknown":
+            info["partition"] = "fasth3"
     # The adapter is fused over whatever the checkpoint says, so it wins. A
     # FastH3 box may not set MINIMAX_H3_MODEL_DIR at all, which is why this
-    # sits outside the block above.
+    # sits outside the blocks above.
     lora_path = setting("H3_LORA_PATH", "")
     override = fasth3_steps(setting("H3_FASTH3", ""))
     fused = override if override is not None else (FASTH3_STEPS if lora_path else 0)
     if fused:
         info.update(pinned_steps=fused, locked_shifts=True, tasks=["t2va"],
-                    adapter=adapter_label(lora_path))
+                    adapter=(adapter_label(lora_path) if lora_path
+                             else f"fasth3 ({fused} step)"))
     return info
 
 
@@ -406,18 +550,28 @@ PARTITION = load_partition()
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+JOBS_READY = threading.Condition(JOBS_LOCK)
 
 # One worker per upstream draining a shared FIFO, rather than a thread per job
 # contending on a lock: threading.Lock has no ordering guarantee, so queued
 # work used to start in an arbitrary order. Each GPU serialises its own work,
 # so this makes the order you submitted the order work starts, across however
 # many boxes are configured.
-JOB_QUEUE = queue.Queue()
+#
+# A deque under JOBS_LOCK rather than a queue.Queue, because not every box can
+# serve every job. A FastVideo worker takes the oldest job it can run and
+# leaves the rest in order for a vLLM-Omni one, where a plain FIFO would hand
+# it an fl2va job to fail. Holding the same lock as JOBS also makes taking a
+# job and marking it running one step, so a cancel cannot land in between.
+# Entries are (job_id, params, media, lang); only queued jobs are in it.
+JOB_QUEUE = collections.deque()
 
 # Finished jobs stay listed so the queue view keeps its history across a page
 # reload, but not without bound.
 MAX_FINISHED = 60
 FINAL_STATES = ("done", "failed", "cancelled")
+
+ATTACHMENT_KEYS = ("image", "audio", "videos")
 
 
 def auth_headers():
@@ -425,8 +579,13 @@ def auth_headers():
 
 
 def split_data_url(value, lang="en"):
-    """Return (mime, raw_bytes) from a data: URL."""
-    match = re.fullmatch(r"data:([^;,]+);base64,(.+)", value or "", re.S)
+    """Return (mime, raw_bytes) from a data: URL.
+
+    The type is held to type/subtype characters because it is copied into a
+    multipart header, where a CR or LF would start a header of its own.
+    """
+    match = re.fullmatch(r"data:([\w.+-]+/[\w.+-]+);base64,(.+)",
+                         value if isinstance(value, str) else "", re.S)
     if not match:
         raise ValueError(t(lang, "attachment_data_url"))
     try:
@@ -435,10 +594,44 @@ def split_data_url(value, lang="en"):
         raise ValueError(t(lang, "attachment_decode", error=exc)) from exc
 
 
+def decode_attachments(raw, lang="en"):
+    """Validate and decode attachments when they arrive, not when the job runs.
+
+    A bad data URL used to surface only once a worker reached the job, which
+    can be hours after the request that queued it. Decoding here also means the
+    queue holds bytes rather than base64 text a third larger.
+
+    Audio is the exception: vLLM-Omni takes it as a URL inside a JSON field
+    rather than as a file part, so it travels as the data URL it arrived as,
+    checked but not kept decoded.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(t(lang, "attachment_shape"))
+    for key in raw:
+        if key not in ATTACHMENT_KEYS:
+            raise ValueError(t(lang, "attachment_unknown", name=str(key)[:40]))
+    videos = raw.get("videos") or []
+    if not isinstance(videos, list):
+        raise ValueError(t(lang, "attachment_shape"))
+    image, audio = raw.get("image"), raw.get("audio")
+    if audio:
+        split_data_url(audio, lang)
+    return {"image": split_data_url(image, lang) if image else None,
+            "audio": audio or None,
+            "videos": [split_data_url(item, lang) for item in videos]}
+
+
+def attached_names(media):
+    """Which attachment fields a job carried, from the fixed set only."""
+    return [key for key in ATTACHMENT_KEYS if media.get(key)]
+
+
 def encode_multipart(fields, files):
     """Build a multipart/form-data body.
 
-    fields: {name: text}. files: [(name, filename, mime, bytes)].
+    fields: {name: text}. files: [(name, filename, mime, bytes)]. Returned as
+    the bytearray it was built in, which urllib sends as is, rather than
+    copying a body that can be hundreds of megabytes once more.
     """
     boundary = "----h3ui" + uuid.uuid4().hex
     body = bytearray()
@@ -453,10 +646,24 @@ def encode_multipart(fields, files):
         body += f"Content-Type: {mime}\r\n\r\n".encode()
         body += blob + b"\r\n"
     body += f"--{boundary}--\r\n".encode()
-    return bytes(body), f"multipart/form-data; boundary={boundary}"
+    return body, f"multipart/form-data; boundary={boundary}"
 
 
-def build_fastvideo_request(params, attachments, lang="en"):
+def can_serve(kind, params):
+    """Whether a box of this kind can run a job, decided before it is taken.
+
+    FastVideo takes text only, has no request LoRA, and bounds the clip by its
+    own frame grid. Everything else is vLLM-Omni's, within its contract.
+    """
+    lo, hi = DURATION_BY_KIND.get(kind, VLLM_DURATION)
+    if not lo <= params["duration"] <= hi:
+        return False
+    if kind == "fastvideo":
+        return params["task"] == "t2va" and not params.get("lora")
+    return True
+
+
+def build_fastvideo_request(params, media, lang="en"):
     """Translate UI parameters into FastVideo's OpenAI compatible video request.
 
     Four differences from the vLLM-Omni body matter. The transport is JSON
@@ -464,20 +671,24 @@ def build_fastvideo_request(params, attachments, lang="en"):
     from a duration, because FastH3 only accepts counts on its causal VAE grid
     and rounding a duration into one behind the caller's back would silently
     change what was measured. Neither shift is ever sent: the released
-    checkpoint owns its five point schedule, and a request naming a shift is
-    refused rather than ignored.
+    checkpoint owns its schedule, and a request naming a shift is refused
+    rather than ignored.
 
-    And num_inference_steps counts something else here. Both servers run the
-    same distilled schedule, five sigma points bounding four denoiser
-    evaluations, but vLLM-Omni names the four and FastVideo names the five. So
-    the same render is steps=4 on one and steps=5 on the other, and neither is
-    wrong. The number is passed through as given rather than translated, so a
-    sidecar always records what was actually sent.
+    And num_inference_steps counts something else here. FastVideo names sigma
+    points, five for FastH3 V1 and nine for V2, where a current vLLM-Omni names
+    the four and eight denoiser evaluations between them. So the same render is
+    steps=4 on one and steps=5 on the other, and neither is wrong. The number
+    is passed through as given rather than translated, so a sidecar always
+    records what was actually sent.
 
     Reference media would ride along as image_reference here. Nothing needs it
-    yet, so an attachment is refused rather than dropped quietly.
+    yet, and the queue never routes an attached job to this kind, so an
+    attachment reaching this point is refused rather than dropped quietly.
+
+    Returns (body, content_type, sent), where `sent` is the body less the
+    prompt, which the sidecar already carries.
     """
-    if any(attachments.get(key) for key in ("image", "audio", "videos")):
+    if attached_names(media):
         raise ValueError(t(lang, "fastvideo_no_reference"))
     body = {
         "model": FASTVIDEO_MODEL,
@@ -491,7 +702,8 @@ def build_fastvideo_request(params, attachments, lang="en"):
     }
     if params.get("width") and params.get("height"):
         body["size"] = f"{params['width']}x{params['height']}"
-    return json.dumps(body).encode(), "application/json"
+    sent = {key: value for key, value in body.items() if key != "prompt"}
+    return json.dumps(body).encode(), "application/json", sent
 
 
 def frame_count(duration, fps):
@@ -505,8 +717,13 @@ def frame_count(duration, fps):
     return raw + (5 - raw) % 17
 
 
-def build_request(params, attachments, lang="en"):
-    """Translate UI parameters into the vLLM-Omni video request."""
+def build_request(params, media, lang="en"):
+    """Translate UI parameters into the vLLM-Omni video request.
+
+    Returns (fields, files, sent). `sent` is what went on the wire less the
+    prompt and the attachment bytes, with the JSON valued fields decoded, so
+    the sidecar can say exactly what the server was asked for.
+    """
     extra = {"task": params["task"], "duration": params["duration"]}
     fields = {
         "prompt": params["prompt"],
@@ -514,15 +731,16 @@ def build_request(params, attachments, lang="en"):
         "seed": params["seed"],
         "fps": params["fps"],
     }
+    lora = None
     # An activated request LoRA brings its own schedule, so it decides the
     # step count and both shifts rather than the form.
     if params.get("lora") and REQUEST_LORA:
         fields["num_inference_steps"] = REQUEST_LORA["steps"]
         fields["flow_shift"] = REQUEST_LORA["flow_shift"]
         extra["audio_flow_shift"] = REQUEST_LORA["audio_flow_shift"]
-        fields["lora"] = json.dumps({"name": REQUEST_LORA["name"],
-                                     "path": REQUEST_LORA["path"],
-                                     "scale": REQUEST_LORA["scale"]})
+        lora = {"name": REQUEST_LORA["name"], "path": REQUEST_LORA["path"],
+                "scale": REQUEST_LORA["scale"]}
+        fields["lora"] = json.dumps(lora)
     # A fused schedule owns both shifts: measured against the 2026-08-31 nightly,
     # the server accepts a value only when it equals the checkpoint's own (12 and
     # 3 for FastH3) and answers "FastH3 requires flow_shift=12, got 8" otherwise.
@@ -531,10 +749,10 @@ def build_request(params, attachments, lang="en"):
     elif not PARTITION["locked_shifts"]:
         fields["flow_shift"] = params["flow_shift"]
         extra["audio_flow_shift"] = params["audio_flow_shift"]
-    # t2va on a current build wants a named ratio and refuses to infer one from
-    # the canvas. fl2va takes its ratio from the input image and ref2va
-    # defaults to 16:9, so neither is sent one.
-    if SERVER_CONTRACT == "current" and params["task"] == "t2va":
+    # t2va on a 2026-08-22 or later build wants a named ratio and refuses to
+    # infer one from the canvas. fl2va takes its ratio from the input image and
+    # ref2va defaults to 16:9, so neither is sent one.
+    if SERVER_CONTRACT != "legacy" and params["task"] == "t2va":
         fields["aspect_ratio"] = named_ratio(params.get("width"),
                                              params.get("height"))
     fields["extra_params"] = json.dumps(extra)
@@ -545,26 +763,34 @@ def build_request(params, attachments, lang="en"):
         fields["height"] = params["height"]
 
     files = []
-    image = attachments.get("image")
-    audio = attachments.get("audio")
-    videos = attachments.get("videos") or []
+    image = media.get("image")
+    videos = media.get("videos") or []
+    audio = media.get("audio")
 
     if image:
-        mime, blob = split_data_url(image, lang)
+        mime, blob = image
         # input_reference is sniffed server-side into an image or video.
         files.append(("input_reference", "reference" +
                       (mimetypes.guess_extension(mime) or ".png"), mime, blob))
     if videos:
         name = "input_references" if len(videos) > 1 else "input_reference"
-        for index, item in enumerate(videos):
-            mime, blob = split_data_url(item, lang)
+        for index, (mime, blob) in enumerate(videos):
             files.append((name, f"reference-{index}" +
                           (mimetypes.guess_extension(mime) or ".mp4"), mime, blob))
     if audio:
-        mime, _ = split_data_url(audio, lang)
         fields["audio_reference"] = json.dumps({"audio_url": audio})
 
-    return fields, files
+    sent = {key: value for key, value in fields.items()
+            if key not in ("prompt", "extra_params", "lora", "audio_reference")}
+    sent["extra_params"] = extra
+    if lora:
+        sent["lora"] = lora
+    if files:
+        sent["files"] = [{"field": name, "type": mime, "bytes": len(blob)}
+                         for name, _, mime, blob in files]
+    if audio:
+        sent["audio_reference"] = {"type": audio[5:audio.find(";")]}
+    return fields, files, sent
 
 
 def server_metrics(headers):
@@ -601,30 +827,38 @@ def server_metrics(headers):
     return found
 
 
-def run_job(job_id, params, attachments, lang="en", api_base=None):
+def write_atomically(target, data):
+    """Write a file under a temporary name and rename it into place.
+
+    A crash or a full disk mid-write would otherwise leave a truncated file
+    that the gallery serves as if it were a result.
+    """
+    partial = target.with_name(target.name + ".part")
+    partial.write_bytes(data)
+    os.replace(partial, target)
+
+
+def run_job(job_id, params, media, lang, api_base, started):
     """Run one generation to completion. Called only by a queue worker.
 
     `lang` is the submitting page's language: a job can fail long after the
     request that queued it, so the language travels with the job rather than
     being read off whichever request happens to collect the error.
 
-    `api_base` is the upstream this worker owns. It is recorded on the job so
-    the queue view can say which box a render is on.
+    `api_base` is the upstream this worker owns, and the job was already marked
+    running on it when the worker took it.
     """
-    api_base = api_base or API_BASE
     def touch(**kw):
         with JOBS_LOCK:
             if job_id in JOBS:
                 JOBS[job_id].update(kw)
 
-    started = time.time()
     kind = BACKEND_KIND.get(api_base, "vllm-omni")
-    touch(state="running", started=started, backend=api_base, backend_kind=kind)
     try:
         if kind == "fastvideo":
-            body, content_type = build_fastvideo_request(params, attachments, lang)
+            body, content_type, sent = build_fastvideo_request(params, media, lang)
         else:
-            fields, files = build_request(params, attachments, lang)
+            fields, files, sent = build_request(params, media, lang)
             body, content_type = encode_multipart(fields, files)
     except ValueError as exc:
         touch(state="failed", error=str(exc), elapsed=0)
@@ -633,46 +867,78 @@ def run_job(job_id, params, attachments, lang="en", api_base=None):
         f"{api_base}/v1/videos/sync", data=body,
         headers={"Content-Type": content_type, **auth_headers()},
         method="POST")
+
+    MEDIA.mkdir(exist_ok=True)
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}.mp4"
+    target = MEDIA / name
+    partial = MEDIA / (name + ".part")
     try:
         with urllib.request.urlopen(request, timeout=REQUEST_TIMEOUT) as response:
-            payload = response.read()
             content_kind = response.headers.get("Content-Type", "")
             metrics = server_metrics(response.headers)
+            # Look at the head before committing anything to disk: an error
+            # page served with a 200 is text, and an MP4 opens on a box size.
+            head = response.read(64 * 1024)
+            if "video" not in content_kind and not head.startswith(b"\x00\x00\x00"):
+                touch(state="failed", elapsed=time.time() - started,
+                      error=f"non-video response ({content_kind}): "
+                            f"{head[:1200].decode('utf-8', 'replace')}")
+                return
+            # Streamed rather than read whole: a long 1344x768 clip is large,
+            # and holding it twice in memory bought nothing.
+            with partial.open("wb") as handle:
+                handle.write(head)
+                shutil.copyfileobj(response, handle, 1024 * 1024)
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", "replace")[:1200]
         touch(state="failed", error=f"HTTP {exc.code}: {detail}",
               elapsed=time.time() - started)
         return
     except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
+        partial.unlink(missing_ok=True)
         touch(state="failed", error=f"{type(exc).__name__}: {exc}",
               elapsed=time.time() - started)
         return
 
     elapsed = time.time() - started
-    if "video" not in content_kind and not payload.startswith(b"\x00\x00\x00"):
-        touch(state="failed", elapsed=elapsed,
-              error=f"non-video response ({content_kind}): "
-                    f"{payload[:1200].decode('utf-8', 'replace')}")
-        return
+    os.replace(partial, target)
+    # The sidecar lands last, so a crash before it leaves a file the history
+    # does not list rather than a record pointing at nothing.
+    write_atomically(MEDIA / (name + ".json"), json.dumps(
+        {**params, "elapsed": elapsed, "file": name,
+         "backend": api_base, "backend_kind": kind, "sent": sent,
+         **({"server_metrics": metrics} if metrics else {}),
+         "attached": attached_names(media)},
+        indent=2, ensure_ascii=False).encode("utf-8"))
+    touch(state="done", elapsed=elapsed, file=name, size=target.stat().st_size)
 
-    MEDIA.mkdir(exist_ok=True)
-    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}.mp4"
-    (MEDIA / name).write_bytes(payload)
-    (MEDIA / (name + ".json")).write_text(
-        json.dumps({**params, "elapsed": elapsed, "file": name,
-                    "backend": api_base, "backend_kind": kind,
-                    **({"server_metrics": metrics} if metrics else {}),
-                    "attached": sorted(k for k, v in attachments.items() if v)},
-                   indent=2, ensure_ascii=False))
-    touch(state="done", elapsed=elapsed, file=name, size=len(payload))
+
+def take_job(api_base, timeout):
+    """The oldest queued job this box can serve, now marked running, or None.
+
+    Waits up to `timeout` for one to arrive. Taking and marking happen under
+    one lock, so a job is either cancelled or running, never cancelled after a
+    worker has already committed to it.
+    """
+    kind = BACKEND_KIND.get(api_base, "vllm-omni")
+    with JOBS_READY:
+        for entry in JOB_QUEUE:
+            if can_serve(kind, entry[1]):
+                JOB_QUEUE.remove(entry)
+                started = time.time()
+                JOBS[entry[0]].update(state="running", started=started,
+                                      backend=api_base, backend_kind=kind)
+                return (*entry, started)
+        JOBS_READY.wait(timeout)
+    return None
 
 
 def worker_loop(api_base):
     """Drain the shared queue forever, one job at a time on this upstream.
 
     One worker per upstream, all pulling from the same FIFO: whichever box
-    frees up first takes the next job, and submission order is still the order
-    work starts.
+    frees up first takes the next job it can serve, and submission order is
+    still the order work starts.
     """
     while True:
         # Do not draw work while this box is unreachable. Leaving the job in
@@ -683,24 +949,21 @@ def worker_loop(api_base):
         if not usable:
             time.sleep(PROBE_INTERVAL)
             continue
-        try:
-            job_id, params, attachments, lang = JOB_QUEUE.get(
-                timeout=PROBE_INTERVAL)
-        except queue.Empty:
+        taken = take_job(api_base, PROBE_INTERVAL)
+        if taken is None:
             continue          # recheck this box's health, then wait again
+        job_id, params, media, lang, started = taken
         try:
-            with JOBS_LOCK:
-                job = JOBS.get(job_id)
-                skip = job is None or job.get("state") == "cancelled"
-            if not skip:
-                run_job(job_id, params, attachments, lang, api_base)
+            run_job(job_id, params, media, lang, api_base, started)
         except Exception as exc:  # noqa: BLE001 - a bad job must not end the worker
             with JOBS_LOCK:
                 if job_id in JOBS:
                     JOBS[job_id].update(
-                        state="failed", error=f"{type(exc).__name__}: {exc}")
+                        state="failed", error=f"{type(exc).__name__}: {exc}",
+                        elapsed=time.time() - started)
         finally:
-            JOB_QUEUE.task_done()
+            # Release the attachments now rather than at the next job.
+            taken = media = None
             prune_jobs()
 
 
@@ -712,22 +975,36 @@ def prune_jobs():
             JOBS.pop(job["id"], None)
 
 
+def queue_positions():
+    """{job_id: 1-based place in line}. Call with JOBS_LOCK held."""
+    return {entry[0]: index for index, entry in enumerate(JOB_QUEUE, 1)}
+
+
 def job_list():
     """Every job the queue view needs, newest first, without the attachments."""
     now = time.time()
     with JOBS_LOCK:
         jobs = [dict(job) for job in JOBS.values()]
+        positions = queue_positions()
     for job in jobs:
         if job.get("state") == "running" and job.get("started"):
             job["elapsed"] = now - job["started"]
+        if job["id"] in positions:
+            job["position"] = positions[job["id"]]
     jobs.sort(key=lambda j: j.get("created", 0), reverse=True)
-    waiting = [j["id"] for j in sorted(
-        (j for j in jobs if j.get("state") == "queued"),
-        key=lambda j: j.get("created", 0))]
-    for job in jobs:
-        if job.get("state") == "queued":
-            job["position"] = waiting.index(job["id"]) + 1
     return jobs
+
+
+def enqueue(params, media, lang):
+    """Queue a job and wake the workers. Returns (job_id, position)."""
+    job_id = uuid.uuid4().hex
+    with JOBS_READY:
+        JOBS[job_id] = {"id": job_id, "state": "queued", "params": params,
+                        "estimate": estimate_seconds(params),
+                        "created": time.time()}
+        JOB_QUEUE.append((job_id, params, media, lang))
+        JOBS_READY.notify_all()
+        return job_id, len(JOB_QUEUE)
 
 
 def forget_job(job_id):
@@ -769,19 +1046,13 @@ def cancel_job(job_id):
             # synchronous, so there is nothing safe to interrupt.
             return job.get("state")
         job["state"] = "cancelled"
+        # Out of the line too, so its attachments are released now rather
+        # than whenever a worker would have skipped past it.
+        for entry in JOB_QUEUE:
+            if entry[0] == job_id:
+                JOB_QUEUE.remove(entry)
+                break
         return "cancelled"
-
-
-def queue_position(job_id):
-    """1-based place in line among jobs still waiting, or None if not waiting."""
-    with JOBS_LOCK:
-        waiting = sorted(
-            (j for j in JOBS.values() if j.get("state") == "queued"),
-            key=lambda j: j.get("created", 0))
-    for index, job in enumerate(waiting, 1):
-        if job["id"] == job_id:
-            return index
-    return None
 
 
 def compose_prompt(payload, task, duration):
@@ -925,7 +1196,8 @@ def backend_view(api_base, busy_bases):
         snapshot = dict(STATUS_CACHE[api_base])
     state = ("starting" if snapshot["online"] is None
              else "online" if snapshot["online"] else "offline")
-    return {"base": api_base, "state": state,
+    return {"base": api_base, "kind": BACKEND_KIND.get(api_base, "vllm-omni"),
+            "state": state,
             "busy": api_base in busy_bases,
             # A probe or two can be swallowed by a busy upstream. Say so
             # rather than presenting the reading as current.
@@ -955,7 +1227,7 @@ def service_status(lang="en"):
     with JOBS_LOCK:
         busy_bases = {j.get("backend") for j in JOBS.values()
                       if j.get("state") == "running"}
-        waiting = sum(1 for j in JOBS.values() if j.get("state") == "queued")
+        waiting = len(JOB_QUEUE)
     backends = [backend_view(api_base, busy_bases) for api_base in API_BASES]
     live = [b for b in backends if b["state"] == "online"]
 
@@ -972,25 +1244,193 @@ def service_status(lang="en"):
             "busy": bool(busy_bases),
             "stale": any(b["stale"] for b in live),
             "model": live[0]["model"],
-            "profile": ENV.get("H3_CACHE_BACKEND", "none"),
-            "attention": ENV.get("H3_DIFFUSION_ATTENTION_BACKEND", ""),
-            "execution": ENV.get("H3_EXECUTION_MODE", "")}
+            "profile": setting("H3_CACHE_BACKEND", "none"),
+            "attention": setting("H3_DIFFUSION_ATTENTION_BACKEND", ""),
+            "execution": setting("H3_EXECUTION_MODE", "")}
 
 
 def history():
+    """The newest results' sidecars. A file deleted mid-scan is skipped."""
     if not MEDIA.is_dir():
         return []
     items = []
     for meta in sorted(MEDIA.glob("*.mp4.json"), reverse=True)[:40]:
         try:
-            items.append(json.loads(meta.read_text()))
-        except json.JSONDecodeError:
+            items.append(json.loads(meta.read_text(encoding="utf-8")))
+        except (OSError, ValueError):
             continue
     return items
 
 
+class Rejected(ValueError):
+    """A request refused with a message meant for the person who sent it."""
+
+
+def whole_number(payload, key, default, lang, message="param_positive"):
+    """A positive integer field, the default when absent, else Rejected.
+
+    A fractional number is refused rather than truncated: 4.5 steps silently
+    becoming 4 would leave a sidecar that disagrees with the request.
+    """
+    value = payload.get(key)
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool) or (isinstance(value, float)
+                                   and not value.is_integer()):
+        raise Rejected(t(lang, message, name=key))
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise Rejected(t(lang, message, name=key)) from None
+    if number < 1:
+        raise Rejected(t(lang, message, name=key))
+    return number
+
+
+def number(payload, key, default, lang, message):
+    """A finite float field, the default when absent, else Rejected."""
+    value = payload.get(key, default)
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise Rejected(t(lang, message)) from None
+    if isinstance(value, bool) or result != result or result in (
+            float("inf"), float("-inf")):
+        raise Rejected(t(lang, message))
+    return result
+
+
+def parse_generate(payload, lang="en"):
+    """Validate a /api/generate body into (params, media), or raise Rejected.
+
+    Mirrors the pipeline's own constraints so the UI fails fast instead of
+    spending a cold request on a rejected combination, and so a malformed field
+    answers with a 400 that names it rather than a dropped connection.
+    """
+    if not isinstance(payload, dict):
+        raise Rejected(t(lang, "body_json_object"))
+
+    task = str(payload.get("task", "t2va"))
+    if task not in PARTITION["tasks"]:
+        # Blaming the checkpoint would be a lie when it is the fused adapter
+        # that narrowed the task list.
+        raise Rejected(t(lang, "task_adapter", adapter=PARTITION["adapter"],
+                         tasks=PARTITION["tasks"])
+                       if PARTITION["adapter"] else
+                       t(lang, "task_unsupported",
+                         partition=PARTITION["partition"],
+                         tasks=PARTITION["tasks"]))
+
+    duration = number(payload, "duration", DURATION_MIN, lang, "duration_number")
+    if not DURATION_MIN <= duration <= DURATION_MAX:
+        raise Rejected(t(lang, "duration_range", lo=DURATION_MIN,
+                         hi=DURATION_MAX))
+
+    turbo = bool(payload.get("turbo"))
+    if turbo:
+        if not REQUEST_LORA:
+            raise Rejected(t(lang, "turbo_unavailable"))
+        if PARTITION["adapter"]:
+            # A fused checkpoint refuses a request that also names a LoRA, so
+            # the two adapters are mutually exclusive by construction.
+            raise Rejected(t(lang, "turbo_fused", adapter=PARTITION["adapter"]))
+        if task not in REQUEST_LORA["tasks"]:
+            raise Rejected(t(lang, "turbo_task", name=REQUEST_LORA["name"],
+                             task=task, tasks=REQUEST_LORA["tasks"]))
+
+    pinned = PARTITION["pinned_steps"]
+    steps = whole_number(payload, "steps", pinned or 20, lang, "steps_number")
+    # Reject rather than quietly force. A request that asked for 20 steps and
+    # got 4 would leave a sidecar that says something the render never did.
+    if pinned and steps != pinned:
+        raise Rejected(t(lang, "steps_pinned", adapter=PARTITION["adapter"],
+                         steps=pinned))
+    if PARTITION["locked_shifts"] and (
+            "flow_shift" in payload or "audio_flow_shift" in payload):
+        raise Rejected(t(lang, "shifts_locked", adapter=PARTITION["adapter"]))
+
+    prompt = compose_prompt(payload, task, duration)
+    if not prompt:
+        raise Rejected(t(lang, "prompt_required"))
+
+    try:
+        media = decode_attachments(payload.get("attachments") or {}, lang)
+    except ValueError as exc:
+        raise Rejected(str(exc)) from None
+    image, audio, videos = media["image"], media["audio"], media["videos"]
+    problem = None
+    if task == "t2va" and (image or audio or videos):
+        problem = "t2va_no_attachments"
+    elif task == "fl2va":
+        if not image:
+            problem = "fl2va_needs_image"
+        elif audio or videos:
+            problem = "fl2va_image_only"
+    elif task == "ref2va":
+        if videos and (image or audio):
+            problem = "ref2va_video_exclusive"
+        elif not videos and not (image and audio):
+            problem = "ref2va_pair_or_video"
+    if problem:
+        raise Rejected(t(lang, problem))
+
+    if turbo:
+        steps = REQUEST_LORA["steps"]
+
+    params = {
+        "task": task,
+        "prompt": prompt,
+        "width": whole_number(payload, "width", None, lang),
+        "height": whole_number(payload, "height", None, lang),
+        "steps": steps,
+        "duration": duration,
+        "fps": whole_number(payload, "fps", 24, lang),
+        "seed": resolve_seed(payload.get("seed")),
+    }
+    # The sidecar is {**params, ...}, so recording the adapter and dropping
+    # the shifts that were never sent costs one branch each.
+    if turbo:
+        params["lora"] = {"name": REQUEST_LORA["name"],
+                          "scale": REQUEST_LORA["scale"],
+                          "flow_shift": REQUEST_LORA["flow_shift"],
+                          "audio_flow_shift": REQUEST_LORA["audio_flow_shift"]}
+    elif PARTITION["locked_shifts"]:
+        params["adapter"] = PARTITION["adapter"]
+    else:
+        params["flow_shift"] = number(payload, "flow_shift", 12, lang,
+                                      "shift_number")
+        params["audio_flow_shift"] = number(payload, "audio_flow_shift", 3.0,
+                                            lang, "shift_number")
+    # Keep the sections as written when the structured form was used, so a
+    # result can be reopened and edited rather than only re-run verbatim.
+    for key in ("description", "soundscape", "music"):
+        value = str(payload.get(key) or "").strip()
+        if value:
+            params[key] = value
+
+    # Queued work nobody can take would wait forever, so say so now. Only a
+    # FastVideo-only fleet can get here: vLLM-Omni's bounds are the form's.
+    if not any(can_serve(kind, params) for kind in KINDS_PRESENT):
+        lo, hi = FASTVIDEO_DURATION
+        raise Rejected(t(lang, "no_upstream",
+                         reason=t(lang, "reason_fastvideo", lo=lo, hi=hi)))
+    return params, media
+
+
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # A browser dropping an idle keep-alive connection, or abandoning a
+        # video range it no longer needs, is routine. The stock handler prints
+        # a traceback for each, which buried the log in hundreds of them.
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    # Without it an idle keep-alive connection holds its thread forever.
+    timeout = 120
 
     def log_message(self, fmt, *args):
         pass
@@ -1010,22 +1450,87 @@ class Handler(BaseHTTPRequestHandler):
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
-        self.wfile.write(body)
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _refuse(self, code, error):
+        """Answer an error and drop the connection.
+
+        Used wherever a request body may still be unread: on HTTP/1.1 the
+        leftover bytes would otherwise be parsed as the next request.
+        """
+        self._send(code, json.dumps({"error": error}),
+                   extra={"Connection": "close"})
+
+    def _safely(self, handler):
+        """Run one route, turning an unexpected exception into a JSON 500.
+
+        Without this, any bug answered with a dropped connection and a
+        traceback on stderr, which the page could only report as a frontend
+        error.
+        """
+        try:
+            handler()
+        except ConnectionError:
+            self.close_connection = True
+        except Exception as exc:  # noqa: BLE001 - reported to the caller
+            traceback.print_exc()
+            self.close_connection = True
+            try:
+                self._send(500, json.dumps(
+                    {"error": f"{type(exc).__name__}: {exc}"}))
+            except OSError:
+                pass
+
+    def same_origin(self):
+        """Whether a browser request came from this page rather than another site.
+
+        Any site the user visits can make the browser send a request here, and
+        the ones that need no preflight arrive with an Origin header naming
+        that site. Tools like curl send none, and are not a browser being used
+        against its owner.
+        """
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True
+        host = (self.headers.get("Host") or "").lower()
+        return urllib.parse.urlsplit(origin).netloc.lower() == host
 
     def do_GET(self):
+        self._safely(self._get)
+
+    def do_HEAD(self):
+        self._safely(self._get)
+
+    def do_POST(self):
+        self._safely(self._post)
+
+    def do_DELETE(self):
+        self._safely(self._delete)
+
+    def _get(self):
         path = self.path.split("?")[0]
         if path == "/":
-            self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+            if self.headers.get("If-None-Match") == INDEX_ETAG:
+                self.send_response(304)
+                self.send_header("ETag", INDEX_ETAG)
+                self.end_headers()
+                return
+            self._send(200, INDEX_BYTES, "text/html; charset=utf-8",
+                       {"ETag": INDEX_ETAG, "Cache-Control": "no-cache"})
         elif path == "/api/status":
             self._send(200, json.dumps(service_status(self.lang)))
         elif path.startswith("/api/job/"):
             with JOBS_LOCK:
                 job = dict(JOBS.get(path.rsplit("/", 1)[-1], {}))
+                positions = queue_positions()
             if not job:
                 self._send(404, json.dumps({"error": "unknown job"}))
                 return
             if job.get("state") == "running":
                 job["elapsed"] = time.time() - job["started"]
+            if job["id"] in positions:
+                job["position"] = positions[job["id"]]
             self._send(200, json.dumps(job))
         elif path == "/api/jobs":
             self._send(200, json.dumps(job_list()))
@@ -1067,7 +1572,22 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, json.dumps({"error": "not found"}))
             return
         kind = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        size = target.stat().st_size
+        stat = target.stat()
+        size = stat.st_size
+        # Results are written once under a unique name and never change, so
+        # the browser may keep them. The gallery re-renders up to forty
+        # <video> elements on every completion and used to refetch each.
+        etag = f'"{size:x}-{stat.st_mtime_ns:x}"'
+        cache = {"ETag": etag,
+                 "Last-Modified": formatdate(stat.st_mtime, usegmt=True),
+                 "Cache-Control": ("public, max-age=31536000, immutable"
+                                   if name.endswith(".mp4") else "no-cache")}
+        if self.headers.get("If-None-Match") == etag:
+            self.send_response(304)
+            for key, value in cache.items():
+                self.send_header(key, value)
+            self.end_headers()
+            return
         span = self.parse_range(self.headers.get("Range"), size)
         start, end = span if span else (0, size - 1)
         length = end - start + 1
@@ -1076,6 +1596,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(length))
         self.send_header("Accept-Ranges", "bytes")
+        for key, value in cache.items():
+            self.send_header(key, value)
         if span:
             self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
         self.end_headers()
@@ -1094,9 +1616,12 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             # Routine: the gallery re-renders and the browser drops the
             # transfers it no longer needs.
-            pass
+            self.close_connection = True
 
-    def do_DELETE(self):
+    def _delete(self):
+        if not self.same_origin():
+            self._refuse(403, t(self.lang, "cross_origin"))
+            return
         path = self.path.split("?")[0]
         if path.startswith("/api/history/"):
             self.delete_media(path[len("/api/history/"):])
@@ -1104,17 +1629,20 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"forgotten": forget_finished_jobs()}))
         elif path.startswith("/api/job/"):
             job_id = path[len("/api/job/"):]
-            state = forget_job(job_id)
-            if state is None:
-                self._send(404, json.dumps({"error": "unknown job"}))
-            elif state == "forgotten":
-                self._send(200, json.dumps({"id": job_id, "state": state}))
-            else:
-                self._send(409, json.dumps(
-                    {"error": t(self.lang, "forget_state", state=state),
-                     "state": state}))
+            self.job_action(job_id, forget_job(job_id), "forgotten",
+                            "forget_state")
         else:
             self._send(404, json.dumps({"error": "not found"}))
+
+    def job_action(self, job_id, state, success, refusal):
+        """Answer a cancel or a forget: 404, 200, or 409 naming the state."""
+        if state is None:
+            self._send(404, json.dumps({"error": "unknown job"}))
+        elif state == success:
+            self._send(200, json.dumps({"id": job_id, "state": state}))
+        else:
+            self._send(409, json.dumps(
+                {"error": t(self.lang, refusal, state=state), "state": state}))
 
     def delete_media(self, name):
         """Delete one result and its sidecar. Unlinking, so no undo."""
@@ -1148,164 +1676,52 @@ class Handler(BaseHTTPRequestHandler):
         forget_jobs_for_file(name)
         self._send(200, json.dumps({"deleted": removed}))
 
-    def do_POST(self):
-        if self.path.startswith("/api/job/") and self.path.endswith("/cancel"):
-            job_id = self.path[len("/api/job/"):-len("/cancel")]
-            state = cancel_job(job_id)
-            if state is None:
-                self._send(404, json.dumps({"error": "unknown job"}))
-            elif state == "cancelled":
-                self._send(200, json.dumps({"id": job_id, "state": state}))
-            else:
-                self._send(409, json.dumps(
-                    {"error": t(self.lang, "cancel_state", state=state),
-                     "state": state}))
-            return
-        if self.path != "/api/generate":
-            self._send(404, json.dumps({"error": "not found"}))
-            return
+    def _post(self):
         lang = self.lang
-        length = int(self.headers.get("Content-Length", "0"))
+        if not self.same_origin():
+            self._refuse(403, t(lang, "cross_origin"))
+            return
+        path = self.path.split("?")[0]
+        if path.startswith("/api/job/") and path.endswith("/cancel"):
+            if self.headers.get("Content-Length", "0") != "0":
+                self.close_connection = True
+            job_id = path[len("/api/job/"):-len("/cancel")]
+            self.job_action(job_id, cancel_job(job_id), "cancelled",
+                            "cancel_state")
+            return
+        if path != "/api/generate":
+            self._refuse(404, "not found")
+            return
+        # A form or a no-cors fetch from another site can only send the
+        # simple content types, and needs no preflight to do it. Insisting on
+        # JSON turns that into a preflight this server never answers.
+        content_type = self.headers.get("Content-Type", "")
+        if content_type.split(";")[0].strip().lower() != "application/json":
+            self._refuse(415, t(lang, "content_type"))
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = -1
+        if length < 0:
+            self._refuse(400, t(lang, "body_length"))
+            return
         if length > MAX_BODY:
-            self._send(413, json.dumps({"error": t(lang, "body_too_large")}))
+            self._refuse(413, t(lang, "body_too_large"))
             return
         try:
             payload = json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
+        except (UnicodeDecodeError, json.JSONDecodeError):
             self._send(400, json.dumps({"error": "invalid JSON"}))
             return
-
-        task = str(payload.get("task", "t2va"))
-        if task not in PARTITION["tasks"]:
-            # Blaming the checkpoint would be a lie when it is the fused
-            # adapter that narrowed the task list.
-            error = (t(lang, "task_adapter", adapter=PARTITION["adapter"],
-                       tasks=PARTITION["tasks"])
-                     if PARTITION["adapter"] else
-                     t(lang, "task_unsupported",
-                       partition=PARTITION["partition"],
-                       tasks=PARTITION["tasks"]))
-            self._send(400, json.dumps({"error": error}))
-            return
-
         try:
-            duration = float(payload.get("duration", 2.0))
-        except (TypeError, ValueError):
-            self._send(400, json.dumps({"error": t(lang, "duration_number")}))
+            params, media = parse_generate(payload, lang)
+        except Rejected as exc:
+            self._send(400, json.dumps({"error": str(exc)}))
             return
-        if not DURATION_MIN <= duration <= DURATION_MAX:
-            self._send(400, json.dumps(
-                {"error": t(lang, "duration_range", lo=DURATION_MIN,
-                            hi=DURATION_MAX)}))
-            return
-
-        turbo = bool(payload.get("turbo"))
-        if turbo:
-            if not REQUEST_LORA:
-                self._send(400, json.dumps({"error": t(lang, "turbo_unavailable")}))
-                return
-            if PARTITION["adapter"]:
-                # A fused checkpoint refuses a request that also names a LoRA,
-                # so the two adapters are mutually exclusive by construction.
-                self._send(400, json.dumps(
-                    {"error": t(lang, "turbo_fused", adapter=PARTITION["adapter"])}))
-                return
-            if task not in REQUEST_LORA["tasks"]:
-                self._send(400, json.dumps(
-                    {"error": t(lang, "turbo_task", name=REQUEST_LORA["name"],
-                                task=task, tasks=REQUEST_LORA["tasks"])}))
-                return
-
-        try:
-            steps = int(payload.get("steps", 20))
-        except (TypeError, ValueError):
-            self._send(400, json.dumps({"error": t(lang, "steps_number")}))
-            return
-        # Reject rather than quietly force. A request that asked for 20 steps
-        # and got 4 would leave a sidecar that says something the render never
-        # did.
-        pinned = PARTITION["pinned_steps"]
-        if pinned and steps != pinned:
-            self._send(400, json.dumps(
-                {"error": t(lang, "steps_pinned",
-                            adapter=PARTITION["adapter"], steps=pinned)}))
-            return
-        if PARTITION["locked_shifts"] and (
-                "flow_shift" in payload or "audio_flow_shift" in payload):
-            self._send(400, json.dumps(
-                {"error": t(lang, "shifts_locked",
-                            adapter=PARTITION["adapter"])}))
-            return
-
-        prompt = compose_prompt(payload, task, duration)
-        if not prompt:
-            self._send(400, json.dumps({"error": t(lang, "prompt_required")}))
-            return
-
-        attachments = payload.get("attachments") or {}
-        image = attachments.get("image")
-        audio = attachments.get("audio")
-        videos = attachments.get("videos") or []
-
-        # Mirror the pipeline's own constraints so the UI fails fast instead of
-        # spending a cold request on a rejected combination.
-        problem = None
-        if task == "t2va" and (image or audio or videos):
-            problem = "t2va_no_attachments"
-        elif task == "fl2va":
-            if not image:
-                problem = "fl2va_needs_image"
-            elif audio or videos:
-                problem = "fl2va_image_only"
-        elif task == "ref2va":
-            if videos and (image or audio):
-                problem = "ref2va_video_exclusive"
-            elif not videos and not (image and audio):
-                problem = "ref2va_pair_or_video"
-        if problem:
-            self._send(400, json.dumps({"error": t(lang, problem)}))
-            return
-
-        if turbo:
-            steps = REQUEST_LORA["steps"]
-
-        params = {
-            "task": task,
-            "prompt": prompt,
-            "width": int(payload["width"]) if payload.get("width") else None,
-            "height": int(payload["height"]) if payload.get("height") else None,
-            "steps": steps,
-            "duration": duration,
-            "fps": int(payload.get("fps", 24)),
-            "seed": resolve_seed(payload.get("seed")),
-        }
-        # The sidecar is {**params, ...}, so recording the adapter and dropping
-        # the shifts that were never sent costs one branch each.
-        if turbo:
-            params["lora"] = {"name": REQUEST_LORA["name"],
-                              "scale": REQUEST_LORA["scale"],
-                              "flow_shift": REQUEST_LORA["flow_shift"],
-                              "audio_flow_shift": REQUEST_LORA["audio_flow_shift"]}
-        elif PARTITION["locked_shifts"]:
-            params["adapter"] = PARTITION["adapter"]
-        else:
-            params["flow_shift"] = float(payload.get("flow_shift", 12))
-            params["audio_flow_shift"] = float(
-                payload.get("audio_flow_shift", 3.0))
-        # Keep the sections as written when the structured form was used, so a
-        # result can be reopened and edited rather than only re-run verbatim.
-        for key in ("description", "soundscape", "music"):
-            value = str(payload.get(key) or "").strip()
-            if value:
-                params[key] = value
-        job_id = uuid.uuid4().hex
-        with JOBS_LOCK:
-            JOBS[job_id] = {"id": job_id, "state": "queued", "params": params,
-                            "estimate": estimate_seconds(params),
-                            "created": time.time()}
-        JOB_QUEUE.put((job_id, params, attachments, lang))
-        self._send(200, json.dumps(
-            {"id": job_id, "position": queue_position(job_id)}))
+        del payload
+        job_id, position = enqueue(params, media, lang)
+        self._send(200, json.dumps({"id": job_id, "position": position}))
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -1763,7 +2179,9 @@ const fmt = s => s < 90
 const RULES = {
   t2va: "rule.t2va", fl2va: "rule.fl2va", ref2va: "rule.ref2va"
 };
-let TASKS = ["t2va"];
+// null, not ["t2va"]: a t2va-only server matched the initial value, so the
+// mode list was never filled and every submit named an empty task.
+let TASKS = null;
 // The cost model's coefficients arrive over /api/status. They used to be
 // written out twice, once here and once in the server, which is exactly how
 // the two drift apart.
@@ -1889,10 +2307,15 @@ $("preset").onchange = () => {
 $("duration").addEventListener("input", syncAlignHint);
 syncStructured();
 
-$("f-image").onchange = async () => {
+// An object URL rather than a data URL: the preview needs no copy of the file,
+// and the submit reads it once on its own.
+let previewUrl = null;
+$("f-image").onchange = () => {
   const f = $("f-image").files[0];
+  if (previewUrl) { URL.revokeObjectURL(previewUrl); previewUrl = null; }
   if (!f) { $("pv-image").style.display = "none"; return; }
-  $("pv-image").src = await toDataUrl(f);
+  previewUrl = URL.createObjectURL(f);
+  $("pv-image").src = previewUrl;
   $("pv-image").style.display = "block";
 };
 
@@ -1941,22 +2364,58 @@ async function poll() {
     $("svc").className = "pill bad"; $("svc").textContent = tr("hdr.uierror");
   }
 }
-poll(); setInterval(poll, 5000);
+// Polling runs on a timer that skips its turn while the tab is hidden, and the
+// queue view backs off when nothing is waiting or running. Coming back to the
+// tab catches up at once rather than at the next tick.
+function every(ms, fn, idleMs) {
+  let timer = null;
+  const tick = async () => {
+    let busy = true;
+    if (!document.hidden) busy = (await fn()) !== false;
+    timer = setTimeout(tick, busy || !idleMs ? ms : idleMs);
+  };
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) return;
+    clearTimeout(timer); tick();
+  });
+  tick();
+}
+every(5000, poll);
 
+// Every field in a sidecar is escaped on the way in. The files are written by
+// this server, but anything that can reach the media directory can write one,
+// and a sidecar is not a place markup should be able to run from.
+const SAFE_FILE = /^[A-Za-z0-9._-]+$/;
+
+// Old <video> elements keep fetching until collected, so they are stopped and
+// emptied before the markup that holds them is replaced.
+function setVideos(el, html) {
+  if (el.innerHTML === html) return;
+  el.querySelectorAll("video").forEach(v => {
+    v.pause(); v.removeAttribute("src"); v.load();
+  });
+  el.innerHTML = html;
+}
+
+let HIST_HTML = null;
 async function loadHistory() {
-  const items = await (await api("/api/history")).json();
-  $("hist").innerHTML = items.map(i => `
+  let items;
+  try { items = await (await api("/api/history")).json(); } catch (e) { return; }
+  const html = items.filter(i => SAFE_FILE.test(i.file || "")).map(i => `
     <div class="card">
-      <button class="del" title="${tr("del.title")}"
+      <button class="del" title="${esc(tr("del.title"))}"
         onclick="delMedia('${i.file}')">✕</button>
       <video src="/media/${i.file}" muted preload="metadata"
         onclick="show('${i.file}')"></video>
-      <div onclick="show('${i.file}')">${i.task || "t2va"} ·
-        ${i.width || "auto"}×${i.height || "auto"} ·
-        ${i.steps} steps · seed ${i.seed}<br>${fmt(i.elapsed)}${
-        (i.attached || []).length
-          ? " · " + tr("hist.attached") + i.attached.join(",") : ""}</div>
+      <div onclick="show('${i.file}')">${esc(i.task || "t2va")} ·
+        ${esc(i.width || "auto")}×${esc(i.height || "auto")} ·
+        ${esc(i.steps)} steps · seed ${esc(i.seed)}<br>${fmt(+i.elapsed || 0)}${
+        Array.isArray(i.attached) && i.attached.length
+          ? " · " + tr("hist.attached") + esc(i.attached.join(",")) : ""}</div>
     </div>`).join("") || `<p class="hint">${tr("hist.empty")}</p>`;
+  if (html === HIST_HTML) return;
+  HIST_HTML = html;
+  setVideos($("hist"), html);
 }
 
 // Deletion unlinks the file — there is no trash to recover it from, so the
@@ -1970,29 +2429,22 @@ async function delMedia(file) {
     $("stat").className = "status err"; $("stat").textContent = error;
     return;
   }
-  if (shownFile === file) { $("out").innerHTML = ""; shownFile = null; }
+  if (shownFile === file) { setVideos($("out"), ""); shownFile = null; }
   loadHistory();
 }
 loadHistory();
-
-// Open one clip straight from the address bar. A render worth talking about is
-// worth linking to, and the link has to carry the reproduction record with it
-// rather than an instruction to go and find the right card.
-if (location.hash.startsWith("#file=")) {
-  const wanted = decodeURIComponent(location.hash.slice("#file=".length));
-  if (/^[A-Za-z0-9._-]+$/.test(wanted)) show(wanted, true);
-}
 
 // The sidecar is the point of the sidecar: a clip is only reproducible if the
 // numbers that produced it are in front of you when you decide you want it
 // again. Reading it meant opening a file on the server before this, which is
 // exactly the friction that stops anyone doing it.
 async function show(file, deep) {
+  if (!SAFE_FILE.test(file || "")) return;
   shownFile = file;
-  $("out").innerHTML = `<video src="/media/${file}" controls autoplay></video>
+  setVideos($("out"), `<video src="/media/${file}" controls autoplay></video>
     <p class="meta">${file} · <a href="/media/${file}" download>${tr("link.download")}</a> ·
       <a href="#" onclick="delMedia('${file}');return false">${tr("link.delete")}</a></p>
-    <details class="sidecar" id="sidecar"${deep ? " open" : ""}></details>`;
+    <details class="sidecar" id="sidecar"${deep ? " open" : ""}></details>`);
   let text;
   try {
     const r = await api("/media/" + encodeURIComponent(file) + ".json");
@@ -2026,8 +2478,10 @@ function copySidecar(ev) {
   });
 }
 
-const esc = s => (s || "").replace(/[&<>"]/g, c =>
-  ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+function esc(s) {
+  return String(s ?? "").replace(/[&<>"']/g, c =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c]));
+}
 
 const STATE_TAG = {
   queued: ["", "state.queued"], running: ["run", "state.running"],
@@ -2039,9 +2493,10 @@ const STATE_TAG = {
 // page opened would be treated as newly done and yank the player around.
 let seenDone = null;
 
+let QUEUE_HTML = null;
 async function loadQueue() {
   let jobs;
-  try { jobs = await (await api("/api/jobs")).json(); } catch (e) { return; }
+  try { jobs = await (await api("/api/jobs")).json(); } catch (e) { return true; }
 
   const done = jobs.filter(j => j.state === "done");
   if (seenDone === null) {
@@ -2063,18 +2518,18 @@ async function loadQueue() {
   const pending = jobs.filter(j => j.state === "queued" || j.state === "running");
   const shown = pending.length ? pending
     : jobs.slice(0, 3);   // nothing waiting: keep the last few for context
-  $("queue").innerHTML = shown.map(j => {
+  let html = shown.map(j => {
     const [cls, key] = STATE_TAG[j.state] || ["", null];
     const text = key ? tr(key) : j.state;
     const p = j.params || {};
-    let sub = `${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`;
+    let sub = esc(`${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`);
     if (j.state === "running")
       sub += tr("job.progress",
                 {done: fmt(j.elapsed || 0), est: fmt(j.estimate || 0)});
-    else if (j.state === "queued") sub += tr("job.position", {n: j.position});
+    else if (j.state === "queued") sub += tr("job.position", {n: j.position || "?"});
     else if (j.state === "done") sub += ` · ${fmt(j.elapsed || 0)}`;
     else if (j.state === "failed") sub = esc((j.error || "").split("\n")[0]).slice(0, 120);
-    const done = j.state === "done";
+    const done = j.state === "done" && SAFE_FILE.test(j.file || "");
     const final = done || j.state === "failed" || j.state === "cancelled";
     return `<div class="q${done ? " click" : ""}"${
         done ? ` onclick="show('${j.file}')"` : ""}>
@@ -2094,10 +2549,14 @@ async function loadQueue() {
   }).join("") || `<p class="hint">${tr("queue.empty")}</p>`;
   const finished = jobs.filter(j => ["done","failed","cancelled"].includes(j.state));
   if (finished.length > 1) {
-    $("queue").innerHTML += `<p class="hint" style="margin-top:12px">
+    html += `<p class="hint" style="margin-top:12px">
       <a href="#" onclick="forgetFinished();return false">${
         tr("forget.all", {n: finished.length})}</a></p>`;
   }
+  // Rewriting identical markup every two seconds swallowed clicks on Cancel
+  // that landed mid-rewrite.
+  if (html !== QUEUE_HTML) { QUEUE_HTML = html; $("queue").innerHTML = html; }
+  return pending.length > 0;
 }
 
 // Forgetting only drops the queue entry. The video stays on disk and in the
@@ -2115,13 +2574,13 @@ async function forgetFinished() {
 async function cancelJob(id) {
   const r = await api("/api/job/" + id + "/cancel", {method: "POST"});
   if (!r.ok) {
-    const {error} = await r.json();
+    const {error} = await r.json().catch(() => ({error: "HTTP " + r.status}));
     $("stat").className = "status err"; $("stat").textContent = error;
   }
   loadQueue();
 }
 
-loadQueue(); setInterval(loadQueue, 2000);
+every(2000, loadQueue, 10000);
 
 const SEED_MAX = 2147483647;
 const rollSeed = () => { $("seed").value = Math.floor(Math.random() * (SEED_MAX + 1)); };
@@ -2177,47 +2636,67 @@ $("go").onclick = async () => {
   $("stat").className = "status";
   $("stat").textContent = tr("stat.reading");
 
-  const attachments = {};
-  if ($("f-image").files[0] && $("att-image").style.display !== "none")
-    attachments.image = await toDataUrl($("f-image").files[0]);
-  if ($("f-audio").files[0] && $("att-audio").style.display !== "none")
-    attachments.audio = await toDataUrl($("f-audio").files[0]);
-  if ($("f-video").files.length && $("att-video").style.display !== "none")
-    attachments.videos = await Promise.all([...$("f-video").files].map(toDataUrl));
+  // Whatever goes wrong below, the button comes back. A failed read or a
+  // dropped connection used to leave it disabled until a reload.
+  try {
+    const attachments = {};
+    if ($("f-image").files[0] && $("att-image").style.display !== "none")
+      attachments.image = await toDataUrl($("f-image").files[0]);
+    if ($("f-audio").files[0] && $("att-audio").style.display !== "none")
+      attachments.audio = await toDataUrl($("f-audio").files[0]);
+    if ($("f-video").files.length && $("att-video").style.display !== "none")
+      attachments.videos = await Promise.all([...$("f-video").files].map(toDataUrl));
 
-  if ($("rand").checked) rollSeed();
+    if ($("rand").checked) rollSeed();
 
-  // A locked schedule rejects a request that names either shift, so the page
-  // must not send what it is not showing.
-  const shifts = $("flow-wrap").style.display === "none" ? {} :
-    {flow_shift: +$("flow").value, audio_flow_shift: +$("aflow").value};
-  const turbo = !!(LORA && $("turbo").checked);
+    // A locked schedule rejects a request that names either shift, so the page
+    // must not send what it is not showing.
+    const shifts = $("flow-wrap").style.display === "none" ? {} :
+      {flow_shift: +$("flow").value, audio_flow_shift: +$("aflow").value};
+    const turbo = !!(LORA && $("turbo").checked);
+    // An empty seed box is "draw one", not the 0 that +"" would make it.
+    const seed = $("seed").value.trim() === "" ? null : +$("seed").value;
 
-  $("stat").textContent = tr("stat.sending");
-  const res = await api("/api/generate", {
-    method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({
-      task: $("task").value, ...text, width, height,
-      steps: +$("steps").value, duration: +$("duration").value,
-      fps: +$("fps").value, ...shifts, turbo, seed: +$("seed").value, attachments
-    })
-  });
-  const {position, error} = await res.json();
-  $("go").disabled = false;
-  if (error) {
-    $("stat").className = "status err"; $("stat").textContent = error;
-    return;
+    $("stat").textContent = tr("stat.sending");
+    const res = await api("/api/generate", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        task: $("task").value, ...text, width, height,
+        steps: +$("steps").value, duration: +$("duration").value,
+        fps: +$("fps").value, ...shifts, turbo, seed, attachments
+      })
+    });
+    const {position, error} = await res.json()
+      .catch(() => ({error: "HTTP " + res.status}));
+    if (error) {
+      $("stat").className = "status err"; $("stat").textContent = error;
+      return;
+    }
+    $("stat").className = "status";
+    $("stat").textContent = position > 1
+      ? tr("stat.queued", {n: position - 1})
+      : tr("stat.next");
+    loadQueue();
+  } catch (e) {
+    $("stat").className = "status err"; $("stat").textContent = String(e);
+  } finally {
+    $("go").disabled = false;
   }
-  $("stat").className = "status";
-  $("stat").textContent = position > 1
-    ? tr("stat.queued", {n: position - 1})
-    : tr("stat.next");
-  loadQueue();
 };
+
+// Open one clip straight from the address bar. A render worth talking about is
+// worth linking to, and the link has to carry the reproduction record with it
+// rather than an instruction to go and find the right card.
+if (location.hash.startsWith("#file=")) {
+  const wanted = decodeURIComponent(location.hash.slice("#file=".length));
+  if (/^[A-Za-z0-9._-]+$/.test(wanted)) show(wanted, true);
+}
 </script>
 </body>
 </html>
 """
+INDEX_BYTES = INDEX_HTML.encode("utf-8")
+INDEX_ETAG = '"' + hashlib.sha256(INDEX_BYTES).hexdigest()[:16] + '"'
 
 
 if __name__ == "__main__":
@@ -2227,17 +2706,37 @@ if __name__ == "__main__":
                          name=f"JobQueue-{index}").start()
         threading.Thread(target=status_prober_loop, args=(upstream,),
                          daemon=True, name=f"StatusProbe-{index}").start()
-    print(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
-    print(f"upstream: {', '.join(API_BASES)}  auth: {'on' if API_KEY else 'off'}")
-    print(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}"
-          f"  contract: {SERVER_CONTRACT}")
+    # flush: stdout is block buffered when redirected to a log, and these
+    # lines used to be lost whenever the process was killed rather than
+    # stopped.
+    say = lambda text: print(text, flush=True)
+    say(f"H3 UI  ->  http://{UI_HOST}:{UI_PORT}")
+    say(f"upstream: {', '.join(f'{b} ({BACKEND_KIND[b]})' for b in API_BASES)}"
+        f"  auth: {'on' if API_KEY else 'off'}")
+    say(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}"
+        f"  contract: {SERVER_CONTRACT}")
+    if REQUEST_LORA:
+        say(f"request lora: {REQUEST_LORA['name']}  steps {REQUEST_LORA['steps']}"
+            f"  shifts {REQUEST_LORA['flow_shift']:g}/"
+            f"{REQUEST_LORA['audio_flow_shift']:g}  tasks {REQUEST_LORA['tasks']}")
     if PARTITION["adapter"]:
-        print(f"adapter: {PARTITION['adapter']}  "
-              f"steps pinned at {PARTITION['pinned_steps']}, shifts locked")
+        say(f"adapter: {PARTITION['adapter']}  "
+            f"steps pinned at {PARTITION['pinned_steps']}, shifts locked")
         if len(API_BASES) > 1:
             # Nothing on the wire advertises the fusion, so this cannot be
             # checked per box. A box started without --lora-path would accept
             # a four step request and return mush.
-            print("warning: every upstream must have been started with "
-                  "--lora-path; a mixed pair fails silently")
-    ThreadingHTTPServer((UI_HOST, UI_PORT), Handler).serve_forever()
+            say("warning: every upstream must have been started with the same "
+                "adapter or checkpoint; a mixed pair fails silently")
+        if len(KINDS_PRESENT) > 1:
+            # The pinned number is sent as given, and the two servers count
+            # the same schedule differently, so one kind will refuse it.
+            say("warning: vLLM-Omni and FastVideo count a pinned schedule "
+                "differently (4 and 5, or 8 and 9); one kind will refuse it")
+    server = Server((UI_HOST, UI_PORT), Handler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
