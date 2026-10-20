@@ -14,6 +14,7 @@ import base64
 import binascii
 import collections
 import hashlib
+import http.client
 import json
 import mimetypes
 import os
@@ -139,6 +140,30 @@ MESSAGES = {
         "reason_fastvideo":
             "FastVideo takes t2va only, without the request LoRA, between "
             "{lo} and {hi} seconds",
+        "feature_contract":
+            "{feature} needs a vLLM-Omni server on the current contract",
+        "feature_off": "{feature} is not enabled on this frontend ({key})",
+        "long_needed": "Above 15 seconds, tick long video",
+        "long_mode": "Continuation is Ref2VA only; other modes render long video in full",
+        "long_window":
+            "Window and overlap must be on the 17n+5 grid, the window {lo} to "
+            "{hi} frames and larger than the overlap",
+        "long_prompts":
+            "This clip runs {n} continuation windows, so give {n} prompts or none",
+        "lock_source": "Locking the soundtrack needs ref2va with one reference audio",
+        "edit_canvas": "Editing needs an explicit width and height, not auto",
+        "edit_number": "Edit strengths and times must be numbers, strengths 0 to 1",
+        "edit_noop": "This edit regenerates everything; nothing of the source is kept",
+        "edit_source_video": "Keeping any of the picture needs a source video",
+        "edit_source_audio": "Keeping any of the sound needs a source audio or a source video",
+        "edit_sources_only": "A source clip only goes with an edit",
+        "guide_shape": "Each guide needs a position and an image, a clip or audio",
+        "guide_count": "At most {n} timeline guides",
+        "guide_kind": "Guide {n}: the picture must be an image or a clip, the sound audio",
+        "guide_size": "Guide {n}: {kind} over the {mb} MB limit",
+        "guide_frame": "Guide {n} at {secs} s falls outside a {frames} frame clip",
+        "upscale_number": "Upscale must be {lo} to {hi}x and refine strength above 0, at most 1",
+        "conflict": "{a} cannot be combined with {b}",
     },
     "zh": {
         "attachment_data_url": "附件必須是 base64 data URL",
@@ -173,8 +198,46 @@ MESSAGES = {
         "no_upstream": "目前設定的上游都無法執行這個工作：{reason}",
         "shift_number": "flow_shift 與 audio_flow_shift 必須是數字",
         "reason_fastvideo": "FastVideo 只接 t2va、不能搭配請求 LoRA，秒數需介於 {lo} 到 {hi} 秒",
+        "feature_contract": "{feature} 需要 contract 為 current 的 vLLM-Omni 伺服器",
+        "feature_off": "這個前端沒有開啟 {feature}（{key}）",
+        "long_needed": "超過 15 秒請勾選長片",
+        "long_mode": "續寫只限 ref2va，其他模式的長片以整段方式生成",
+        "long_window": "視窗與重疊都必須落在 17n+5 的格點上，視窗介於 {lo} 到 {hi} 格，且大於重疊",
+        "long_prompts": "這支片會切成 {n} 個續寫視窗，prompt 請給 {n} 段，或一段都不給",
+        "lock_source": "鎖定音軌需要 ref2va 並附一段參考音訊",
+        "edit_canvas": "編輯需要明確的寬與高，不能用自動",
+        "edit_number": "編輯的強度與時間必須是數字，強度介於 0 到 1",
+        "edit_noop": "這個編輯會全部重新生成，來源一點都沒有保留",
+        "edit_source_video": "要保留任何畫面，必須附上來源影片",
+        "edit_source_audio": "要保留任何聲音，必須附上來源音訊或來源影片",
+        "edit_sources_only": "來源片段只能搭配編輯使用",
+        "guide_shape": "每個 guide 都需要位置，以及一張圖片、一段短片或一段音訊",
+        "guide_count": "timeline guide 最多 {n} 個",
+        "guide_kind": "第 {n} 個 guide：畫面必須是圖片或短片，聲音必須是音訊",
+        "guide_size": "第 {n} 個 guide：{kind} 超過 {mb} MB 上限",
+        "guide_frame": "第 {n} 個 guide 位於 {secs} 秒，超出 {frames} 格的片長",
+        "upscale_number": "放大倍率需介於 {lo} 到 {hi} 倍，精修強度需大於 0 且不超過 1",
+        "conflict": "{a} 不能與 {b} 同時使用",
     },
 }
+
+
+FEATURE_NAMES = {
+    "en": {"turbo": "Turbo", "adapter": "a distilled or fused schedule",
+           "continuation": "long video continuation", "long": "long video",
+           "edit": "latent edit", "guides": "timeline guides",
+           "upscale": "latent upscale", "refine": "latent refine",
+           "lock": "a locked soundtrack", "fastvideo": "FastVideo"},
+    "zh": {"turbo": "Turbo", "adapter": "蒸餾或融合的排程",
+           "continuation": "長片續寫", "long": "長片",
+           "edit": "遮罩編輯", "guides": "timeline guides",
+           "upscale": "latent 放大", "refine": "latent 精修",
+           "lock": "鎖定音軌", "fastvideo": "FastVideo"},
+}
+
+
+def feature(lang, key):
+    return (FEATURE_NAMES.get(lang) or FEATURE_NAMES["en"])[key]
 
 
 def pick_lang(explicit, accept=""):
@@ -298,6 +361,57 @@ if SERVER_CONTRACT not in SERVER_CONTRACTS:
     SERVER_CONTRACT = "current"
 STEPS_COUNT_SIGMA_POINTS = SERVER_CONTRACT != "current"
 VLLM_DURATION = (0.5, 60.0) if SERVER_CONTRACT == "legacy" else (4.0, 15.0)
+CURRENT = SERVER_CONTRACT == "current"
+
+
+def switch(key, default):
+    """A yes/no setting. Anything but an explicit no counts as yes."""
+    return setting(key, default).strip().lower() not in ("0", "false", "off", "no")
+
+
+# Encode the MP4 on the worker while the VAE is still decoding (vllm-omni#7018,
+# v0.30.0). The API process then receives finished bytes and skips the
+# synchronous mux on its event loop, which #7095 would move off it and has not.
+# On v0.30.0 that mux stalled the server for 0.67 s on a 1344x768/4 s clip, and
+# 0.03 s with this on; the render takes as long and the MP4 is the same. The
+# gain is on long clips, which never sit decoded in the API process.
+PREENCODE_MP4 = CURRENT and switch("H3_PREENCODE_MP4", "1")
+PREENCODE_BATCH_FRAMES = setting("H3_PREENCODE_BATCH_FRAMES", "")
+
+# Run vLLM-Omni jobs through POST /v1/videos and poll, rather than holding one
+# synchronous request open. The point is DELETE: since vllm-omni#7844 (v0.30.0)
+# MiniMax-H3 stops a cancelled request at the next denoising boundary, so a
+# running job can be cancelled instead of only a queued one.
+ASYNC_JOBS = CURRENT and switch("H3_ASYNC_JOBS", "1")
+POLL_INTERVAL = 2.0
+# How long the upstream may stay unreachable while a job is on it before the
+# job is given up. A server restart takes minutes; a busy one, seconds.
+POLL_GIVE_UP_SECONDS = 300.0
+
+# Long video (vllm-omni#7838, v0.30.0). Above 15 s a request has to opt in with
+# long_video, and then full mode allows 30 s and Ref2VA continuation 300 s.
+# These are the server's sanity bounds, not a promise the canvas fits memory.
+LONG_FULL_MAX = 30.0
+LONG_CONTINUATION_MAX = 300.0
+# Continuation windows live on the 17n+5 frame grid; the defaults are upstream's.
+CONTINUATION_WINDOW = 277
+CONTINUATION_OVERLAP = 22
+CONTINUATION_WINDOW_RANGE = (107, 345)
+
+# Two features the server only has when it was started for them, and which an
+# older one would not refuse but silently ignore. Neither is detectable over
+# the wire, so both are opt in.
+#
+# Timeline guides (vllm-omni#8460, #8838) are on main from 2026-10-13 and in
+# v0.32.0rc1. Latent upscale and refine (#8322, v0.31.0rc1) need the server
+# started with --additional-config latent_upscaler_path; a refine alone needs
+# no checkpoint but the same build.
+TIMELINE_GUIDES = CURRENT and switch("H3_TIMELINE_GUIDES", "0")
+LATENT_UPSCALE = CURRENT and switch("H3_LATENT_UPSCALE", "0")
+GUIDE_MAX = 8
+GUIDE_LIMITS = {"image": 30 << 20, "video": 50 << 20, "audio": 15 << 20}
+# The upscaler was trained between 1x and 4x and only upscales.
+UPSCALE_RANGE = (1.0, 4.0)
 
 # FastVideo bounds the clip by frames on H3's 17n+5 grid, 124 to 362 at 24 fps.
 # 4.5 s is the shortest duration that rounds onto 124 rather than 107, which it
@@ -570,8 +684,11 @@ JOB_QUEUE = collections.deque()
 # reload, but not without bound.
 MAX_FINISHED = 60
 FINAL_STATES = ("done", "failed", "cancelled")
+# On a box: running, or being aborted there and still holding the GPU.
+ACTIVE_STATES = ("running", "cancelling")
 
-ATTACHMENT_KEYS = ("image", "audio", "videos")
+ATTACHMENT_KEYS = ("image", "audio", "videos", "source_video", "source_audio",
+                   "guide_files")
 
 
 def auth_headers():
@@ -594,6 +711,24 @@ def split_data_url(value, lang="en"):
         raise ValueError(t(lang, "attachment_decode", error=exc)) from exc
 
 
+# The server picks a decoder by the upload's suffix, and guess_extension has
+# opinions of its own about some of these (audio/mpeg is not always .mp3).
+EXTENSIONS = {"video/mp4": ".mp4", "video/quicktime": ".mov", "audio/wav": ".wav",
+              "audio/x-wav": ".wav", "audio/wave": ".wav", "audio/mpeg": ".mp3",
+              "audio/mp3": ".mp3", "audio/flac": ".flac", "audio/x-flac": ".flac",
+              "image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}
+
+
+def extension(mime):
+    return EXTENSIONS.get(mime) or mimetypes.guess_extension(mime) or ".bin"
+
+
+def media_kind(mime):
+    """image, video or audio, from a MIME type, or None."""
+    kind = mime.split("/", 1)[0]
+    return kind if kind in ("image", "video", "audio") else None
+
+
 def decode_attachments(raw, lang="en"):
     """Validate and decode attachments when they arrive, not when the job runs.
 
@@ -601,9 +736,10 @@ def decode_attachments(raw, lang="en"):
     can be hours after the request that queued it. Decoding here also means the
     queue holds bytes rather than base64 text a third larger.
 
-    Audio is the exception: vLLM-Omni takes it as a URL inside a JSON field
-    rather than as a file part, so it travels as the data URL it arrived as,
-    checked but not kept decoded.
+    Audio is the exception: an older vLLM-Omni takes it only as a URL inside a
+    JSON field rather than as a file part, so it travels as the data URL it
+    arrived as, checked but not kept decoded, and is decoded when the request
+    is built for a server that takes it as a file.
     """
     if not isinstance(raw, dict):
         raise ValueError(t(lang, "attachment_shape"))
@@ -611,14 +747,19 @@ def decode_attachments(raw, lang="en"):
         if key not in ATTACHMENT_KEYS:
             raise ValueError(t(lang, "attachment_unknown", name=str(key)[:40]))
     videos = raw.get("videos") or []
-    if not isinstance(videos, list):
+    guides = raw.get("guide_files") or []
+    if not isinstance(videos, list) or not isinstance(guides, list):
         raise ValueError(t(lang, "attachment_shape"))
     image, audio = raw.get("image"), raw.get("audio")
     if audio:
         split_data_url(audio, lang)
+    single = {key: split_data_url(raw[key], lang) if raw.get(key) else None
+              for key in ("source_video", "source_audio")}
     return {"image": split_data_url(image, lang) if image else None,
             "audio": audio or None,
-            "videos": [split_data_url(item, lang) for item in videos]}
+            "videos": [split_data_url(item, lang) for item in videos],
+            "guide_files": [split_data_url(item, lang) for item in guides],
+            **single}
 
 
 def attached_names(media):
@@ -655,12 +796,97 @@ def can_serve(kind, params):
     FastVideo takes text only, has no request LoRA, and bounds the clip by its
     own frame grid. Everything else is vLLM-Omni's, within its contract.
     """
-    lo, hi = DURATION_BY_KIND.get(kind, VLLM_DURATION)
-    if not lo <= params["duration"] <= hi:
-        return False
     if kind == "fastvideo":
-        return params["task"] == "t2va" and not params.get("lora")
-    return True
+        lo, hi = FASTVIDEO_DURATION
+        return (lo <= params["duration"] <= hi and params["task"] == "t2va"
+                and not params.get("lora")
+                and not any(params.get(key) for key in VLLM_ONLY))
+    lo, hi = VLLM_DURATION
+    if params.get("long_video"):
+        hi = long_video_max(params["task"], params["long_video"]["mode"])
+    return lo <= params["duration"] <= hi
+
+
+# Request features only a current vLLM-Omni speaks. A job carrying one never
+# goes to a FastVideo box.
+VLLM_ONLY = ("long_video", "audio_mode", "edit", "guides", "latent_upscale",
+             "latent_refine")
+
+
+def long_video_max(task, mode):
+    return LONG_CONTINUATION_MAX if mode == "continuation" else LONG_FULL_MAX
+
+
+def continuation_windows(frames, window, overlap):
+    """How many windows a continuation render samples for this many frames.
+
+    Each window after the first starts `window - overlap` frames on, and the
+    last may be short. Upstream's 75 s example, 1807 frames at 277/22, is 7.
+    """
+    if frames <= window:
+        return 1
+    stride = window - overlap
+    return 1 + -(-(frames - window) // stride)
+
+
+def video_token_of_frame(frame):
+    """The video latent a 24 fps output frame folds into.
+
+    The causal video VAE groups each 17 frame clip into 5 latents: frame 0 on
+    its own, then four frames each. A 17n+5 clip ends on a partial group, so
+    its latent count is 5n+2, which is what the server's grid says.
+    """
+    clip, local = divmod(frame, 17)
+    return clip * 5 + (0 if local == 0 else (local + 3) // 4)
+
+
+def video_latent_count(frames):
+    return 2 if frames <= 5 else (frames - 5) // 17 * 5 + 2
+
+
+def edit_masks(params):
+    """The video and audio noise masks for an edit, as JSON-ready values.
+
+    vllm-omni v0.30.0 reads a video mask as a scalar or on its token grid,
+    [latents, H/32, W/32], here sent flat; raw frame-space masks only arrive
+    with #7947. So a time range is resolved onto that grid on this side, each
+    latent taking the largest value of the frames it covers, so any frame the
+    range touches is regenerated. The audio mask is one value per 40 Hz latent.
+
+    A strength applies inside the range and 0 (keep) outside it; with no
+    range it applies everywhere. Exactly 1 everywhere means "no mask", which
+    the server treats as a no-op anyway, so it is not sent.
+    """
+    edit = params["edit"]
+    frames = frame_count(params["duration"], params["fps"])
+    start, end = edit.get("start"), edit.get("end")
+    ranged = start is not None or end is not None
+    first = 0 if start is None else max(int(round(start * params["fps"])), 0)
+    last = frames if end is None else min(int(round(end * params["fps"])), frames)
+
+    masks = {}
+    video = edit["video"]
+    if not ranged:
+        if video != 1.0:
+            masks["video"] = video
+    else:
+        tokens = [0.0] * video_latent_count(frames)
+        for frame in range(first, last):
+            tokens[video_token_of_frame(frame)] = video
+        if any(value != 1.0 for value in tokens):
+            cells = (params["height"] // 32) * (params["width"] // 32)
+            masks["video"] = [value for value in tokens for _ in range(cells)]
+    audio = edit["audio"]
+    latents = int(round(frames / params["fps"] * 40))
+    if not ranged:
+        if audio != 1.0:
+            masks["audio"] = audio
+    else:
+        lo, hi = first / params["fps"], last / params["fps"]
+        row = [audio if lo <= index / 40 < hi else 0.0 for index in range(latents)]
+        if any(value != 1.0 for value in row):
+            masks["audio"] = row
+    return masks
 
 
 def build_fastvideo_request(params, media, lang="en"):
@@ -731,6 +957,26 @@ def build_request(params, media, lang="en"):
         "seed": params["seed"],
         "fps": params["fps"],
     }
+    if PREENCODE_MP4:
+        extra["preencode_mp4"] = True
+        if PREENCODE_BATCH_FRAMES:
+            extra["preencode_batch_frames"] = int(PREENCODE_BATCH_FRAMES)
+    long_video = params.get("long_video")
+    if long_video:
+        extra["long_video"] = True
+        extra["long_video_mode"] = long_video["mode"]
+        for key, name in (("window", "continuation_window_frames"),
+                          ("overlap", "continuation_overlap_frames"),
+                          ("prompts", "continuation_prompts")):
+            if long_video.get(key):
+                extra[name] = long_video[key]
+    for key in ("audio_mode", "latent_upscale", "latent_refine"):
+        if params.get(key):
+            extra[key] = params[key]
+    # Continuation runs uncached only, and guides need the native path, so
+    # both name it rather than rely on how the server was started.
+    if params.get("guides") or (long_video or {}).get("mode") == "continuation":
+        fields["quality"] = "lossless"
     lora = None
     # An activated request LoRA brings its own schedule, so it decides the
     # step count and both shifts rather than the form.
@@ -767,28 +1013,75 @@ def build_request(params, media, lang="en"):
     videos = media.get("videos") or []
     audio = media.get("audio")
 
+    # On a current server an image + audio pair goes up as two files under
+    # input_references, which H3 sorts by type. As a data URL inside the
+    # audio_reference field it would be a plain form field, and the server
+    # refuses any form field over 1 MiB: a reference track of a few seconds
+    # already is one, and the request died as a reset connection.
+    pair = CURRENT and bool(image) and bool(audio)
     if image:
         mime, blob = image
         # input_reference is sniffed server-side into an image or video.
-        files.append(("input_reference", "reference" +
-                      (mimetypes.guess_extension(mime) or ".png"), mime, blob))
+        files.append(("input_references" if pair else "input_reference",
+                      "reference" + (mimetypes.guess_extension(mime) or ".png"),
+                      mime, blob))
     if videos:
         name = "input_references" if len(videos) > 1 else "input_reference"
         for index, (mime, blob) in enumerate(videos):
             files.append((name, f"reference-{index}" +
                           (mimetypes.guess_extension(mime) or ".mp4"), mime, blob))
-    if audio:
+    if pair:
+        mime, blob = split_data_url(audio, lang)
+        files.append(("input_references", "reference-audio" + extension(mime),
+                      mime, blob))
+    elif audio:
         fields["audio_reference"] = json.dumps({"audio_url": audio})
 
+    # A latent edit sends its sources as files and each mask as a JSON file
+    # part, which is the only form the server reads them in.
+    masks = edit_masks(params) if params.get("edit") else {}
+    for key in ("source_video", "source_audio"):
+        if media.get(key):
+            mime, blob = media[key]
+            files.append((key, key + extension(mime), mime, blob))
+    for key, value in masks.items():
+        files.append((f"{key}_noise_mask", f"{key}-mask.json", "application/json",
+                      json.dumps(value, separators=(",", ":")).encode()))
+
+    # Timeline guides: a manifest naming uploads by position, then the uploads
+    # in that order. Each row brings its own files, so none is shared.
+    manifest = []
+    for guide in params.get("guides") or []:
+        entry = {"frame_index": guide["frame_index"]}
+        for slot in ("image", "video", "audio"):
+            if guide.get(slot) is not None:
+                mime, blob = media["guide_files"][guide[slot]]
+                entry[slot] = {"upload_index": sum(1 for f in files
+                                                   if f[0] == "guide_files")}
+                files.append(("guide_files", f"guide-{len(manifest)}-{slot}"
+                              + extension(mime), mime, blob))
+        manifest.append(entry)
+    if manifest:
+        fields["timeline_guides"] = json.dumps(manifest)
+
     sent = {key: value for key, value in fields.items()
-            if key not in ("prompt", "extra_params", "lora", "audio_reference")}
+            if key not in ("prompt", "extra_params", "lora", "audio_reference",
+                           "timeline_guides")}
     sent["extra_params"] = extra
+    if manifest:
+        sent["timeline_guides"] = manifest
+    if masks:
+        # A token grid is thousands of numbers; the sidecar says what it was
+        # built from instead, which is in params already.
+        sent["noise_masks"] = {key: value if isinstance(value, float)
+                               else f"{len(value)} values"
+                               for key, value in masks.items()}
     if lora:
         sent["lora"] = lora
     if files:
         sent["files"] = [{"field": name, "type": mime, "bytes": len(blob)}
                          for name, _, mime, blob in files]
-    if audio:
+    if audio and not pair:
         sent["audio_reference"] = {"type": audio[5:audio.find(";")]}
     return fields, files, sent
 
@@ -863,6 +1156,10 @@ def run_job(job_id, params, media, lang, api_base, started):
     except ValueError as exc:
         touch(state="failed", error=str(exc), elapsed=0)
         return
+    if kind == "vllm-omni" and ASYNC_JOBS:
+        run_async_job(job_id, params, media, api_base, started, body,
+                      content_type, sent, touch)
+        return
     request = urllib.request.Request(
         f"{api_base}/v1/videos/sync", data=body,
         headers={"Content-Type": content_type, **auth_headers()},
@@ -900,6 +1197,14 @@ def run_job(job_id, params, media, lang, api_base, started):
               elapsed=time.time() - started)
         return
 
+    finish_job(touch, params, media, api_base, kind, sent, metrics, started,
+               partial, target)
+
+
+def finish_job(touch, params, media, api_base, kind, sent, metrics, started,
+               partial, target):
+    """Move a finished download into place, write its sidecar, mark it done."""
+    name = target.name
     elapsed = time.time() - started
     os.replace(partial, target)
     # The sidecar lands last, so a crash before it leaves a file the history
@@ -911,6 +1216,164 @@ def run_job(job_id, params, media, lang, api_base, started):
          "attached": attached_names(media)},
         indent=2, ensure_ascii=False).encode("utf-8"))
     touch(state="done", elapsed=elapsed, file=name, size=target.stat().st_size)
+
+
+def call_upstream(api_base, method, path, body=None, content_type=None, timeout=30):
+    """One call to an upstream: (status, decoded JSON or None, raw bytes).
+
+    An HTTP error status is a reply, not an exception, because the async API
+    answers a failed job's GET with the failure's own status and a JSON body
+    describing it. Only a transport failure raises.
+    """
+    headers = dict(auth_headers())
+    if content_type:
+        headers["Content-Type"] = content_type
+    request = urllib.request.Request(f"{api_base}{path}", data=body,
+                                     headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read()
+    try:
+        data = json.loads(raw) if raw else None
+    except ValueError:
+        data = None
+    return status, data, raw
+
+
+def upstream_error(status, data, raw):
+    """The message a failed upstream call carries, as the UI shows it."""
+    detail = None
+    if isinstance(data, dict):
+        error = data.get("error")
+        detail = (error.get("message") if isinstance(error, dict) else error) \
+            or data.get("detail") or data.get("message")
+    if not detail:
+        detail = raw[:1200].decode("utf-8", "replace")
+    return f"HTTP {status}: {str(detail)[:1200]}"
+
+
+def cancel_requested(job_id):
+    with JOBS_LOCK:
+        return JOBS.get(job_id, {}).get("state") == "cancelling"
+
+
+def run_async_job(job_id, params, media, api_base, started, body,
+                  content_type, sent, touch):
+    """Run one job through vLLM-Omni's job API: create, poll, fetch, delete.
+
+    Holding no request open is what makes a running job cancellable. A cancel
+    marks the job `cancelling`; this loop sees it, asks the server to abort,
+    and calls the job cancelled once the server says it is gone. That answer
+    comes before the GPU is free: the server stops MiniMax-H3 at the next
+    denoising boundary, measured at 10 s after a 2 s confirmation on a GB10.
+    The box's next job may be sent in between and waits on the server, which
+    runs one request at a time, so the two never share the GPU.
+
+    The server's own record answers whether it has started (queued means it
+    is still waiting for the scheduler) and, when done, how long it ran and
+    its peak memory, which is what the sync path read from headers.
+    """
+    status, data, raw = call_upstream(api_base, "POST", "/v1/videos", body,
+                                 content_type, timeout=600)
+    if status != 200 or not isinstance(data, dict) or not data.get("id"):
+        touch(state="failed", error=upstream_error(status, data, raw),
+              elapsed=time.time() - started)
+        return
+    remote = data["id"]
+    touch(remote_id=remote, remote_status=data.get("status") or "queued")
+
+    last_seen = time.time()
+    while True:
+        if cancel_requested(job_id):
+            abort_remote(api_base, remote, touch, started)
+            return
+        try:
+            status, data, raw = call_upstream(api_base, "GET", f"/v1/videos/{remote}")
+        except (OSError, http.client.HTTPException) as exc:
+            # A busy or restarting server. Give it the time a restart takes
+            # before calling the job lost.
+            if time.time() - last_seen > POLL_GIVE_UP_SECONDS:
+                touch(state="failed", elapsed=time.time() - started,
+                      error=f"{type(exc).__name__}: {exc}")
+                return
+            time.sleep(POLL_INTERVAL)
+            continue
+        last_seen = time.time()
+        state = data.get("status") if isinstance(data, dict) else None
+        if status == 200 and state in ("queued", "in_progress"):
+            touch(remote_status=state)
+            time.sleep(POLL_INTERVAL)
+            continue
+        if status == 200 and state == "completed":
+            break
+        # A failed job answers with its failure's status; a 404 means the
+        # server forgot the job, which a restart does.
+        touch(state="failed", elapsed=time.time() - started,
+              error=upstream_error(status, data, raw))
+        upstream_quietly(api_base, "DELETE", f"/v1/videos/{remote}")
+        return
+
+    metrics = {key: data[name] for key, name in
+               (("inference_seconds", "inference_time_s"),
+                ("peak_memory_mb", "peak_memory_mb"),
+                ("stages", "stage_durations"))
+               if data.get(name) not in (None, {}, 0)}
+    MEDIA.mkdir(exist_ok=True)
+    name = f"{time.strftime('%Y%m%d-%H%M%S')}-{job_id[:8]}.mp4"
+    target = MEDIA / name
+    partial = MEDIA / (name + ".part")
+    request = urllib.request.Request(f"{api_base}/v1/videos/{remote}/content",
+                                     headers=auth_headers())
+    try:
+        with urllib.request.urlopen(request, timeout=600) as response:
+            head = response.read(64 * 1024)
+            if not head.startswith(b"\x00\x00\x00"):
+                touch(state="failed", elapsed=time.time() - started,
+                      error="non-video content: "
+                            + head[:1200].decode("utf-8", "replace"))
+                return
+            with partial.open("wb") as handle:
+                handle.write(head)
+                shutil.copyfileobj(response, handle, 1024 * 1024)
+    except Exception as exc:  # noqa: BLE001 - surfaced verbatim in the UI
+        partial.unlink(missing_ok=True)
+        touch(state="failed", elapsed=time.time() - started,
+              error=f"{type(exc).__name__}: {exc}")
+        return
+    finally:
+        # The server keeps every finished job's file until it is deleted.
+        upstream_quietly(api_base, "DELETE", f"/v1/videos/{remote}")
+    finish_job(touch, params, media, api_base, "vllm-omni", sent, metrics,
+               started, partial, target)
+
+
+def upstream_quietly(api_base, method, path):
+    """A best-effort call whose outcome changes nothing here."""
+    try:
+        return call_upstream(api_base, method, path)[0]
+    except (OSError, http.client.HTTPException):
+        return None
+
+
+def abort_remote(api_base, remote, touch, started):
+    """Cancel a job on the server and wait until it says the job is gone.
+
+    DELETE answers 409 while the abort is still in progress, so it is asked
+    again until it answers 200 or 404. If the server never confirms, the job is
+    still marked cancelled rather than left hanging, with the reason attached.
+    """
+    deadline = time.time() + POLL_GIVE_UP_SECONDS
+    note = None
+    while time.time() < deadline:
+        status = upstream_quietly(api_base, "DELETE", f"/v1/videos/{remote}")
+        if status in (200, 404):
+            break
+        note = f"abort unconfirmed (last answer {status})"
+        time.sleep(POLL_INTERVAL)
+    touch(state="cancelled", elapsed=time.time() - started,
+          **({"error": note} if note and status not in (200, 404) else {}))
 
 
 def take_job(api_base, timeout):
@@ -927,7 +1390,8 @@ def take_job(api_base, timeout):
                 JOB_QUEUE.remove(entry)
                 started = time.time()
                 JOBS[entry[0]].update(state="running", started=started,
-                                      backend=api_base, backend_kind=kind)
+                                      backend=api_base, backend_kind=kind,
+                                      cancellable=kind == "vllm-omni" and ASYNC_JOBS)
                 return (*entry, started)
         JOBS_READY.wait(timeout)
     return None
@@ -987,7 +1451,7 @@ def job_list():
         jobs = [dict(job) for job in JOBS.values()]
         positions = queue_positions()
     for job in jobs:
-        if job.get("state") == "running" and job.get("started"):
+        if job.get("state") in ACTIVE_STATES and job.get("started"):
             job["elapsed"] = now - job["started"]
         if job["id"] in positions:
             job["position"] = positions[job["id"]]
@@ -1036,14 +1500,22 @@ def forget_jobs_for_file(name):
 
 
 def cancel_job(job_id):
-    """Cancel a job that has not started. Returns the resulting state."""
+    """Cancel a job. Returns the resulting state.
+
+    A queued job is cancelled on the spot. A running one can be cancelled only
+    on a box that runs jobs through the async API: it becomes `cancelling`,
+    and its worker aborts it upstream and finishes the transition.
+    """
     with JOBS_LOCK:
         job = JOBS.get(job_id)
         if job is None:
             return None
+        if job.get("state") == "running" and job.get("cancellable"):
+            job["state"] = "cancelling"
+            return "cancelling"
         if job.get("state") != "queued":
-            # Running work is already on the GPU and the upstream call is
-            # synchronous, so there is nothing safe to interrupt.
+            # On a synchronous box the work is on the GPU behind one open
+            # request, so there is nothing safe to interrupt.
             return job.get("state")
         job["state"] = "cancelled"
         # Out of the line too, so its attachments are released now rather
@@ -1116,10 +1588,53 @@ def estimate_seconds(params):
     width = params.get("width") or 1344
     height = params.get("height") or 768
     steps = params["steps"]
-    x = width * height / 1e6 * params["duration"]
-    seconds = (EST_FIXED + EST_PER_MPXS * x + EST_PER_MPXS_STEP * x * steps
-               + EST_PER_MPXS2_STEP * x * x * steps)
-    return max(round(seconds), 1)
+    mpx = width * height / 1e6
+
+    def render(seconds, step_count, area=mpx):
+        x = area * seconds
+        return (EST_PER_MPXS * x + EST_PER_MPXS_STEP * x * step_count
+                + EST_PER_MPXS2_STEP * x * x * step_count)
+
+    # Continuation samples each window on its own, so the attention term grows
+    # with the window rather than with the whole clip. Only the decode is paid
+    # on the full length.
+    long_video = params.get("long_video") or {}
+    seconds = params["duration"]
+    if long_video.get("mode") == "continuation":
+        window = long_video.get("window") or CONTINUATION_WINDOW
+        count = continuation_windows(frame_count(seconds, params["fps"]), window,
+                                     long_video.get("overlap") or CONTINUATION_OVERLAP)
+        span = window / params["fps"]
+        total = count * render(span, steps) - (count * span - seconds) \
+            * EST_PER_MPXS * mpx
+    else:
+        total = render(seconds, steps)
+    # An upscale decodes at the target size, and a refine runs its share of
+    # the steps there. Neither has been timed on this box yet, so this is the
+    # same model applied to the larger canvas, not a fit.
+    scale = upscale_factor(params.get("latent_upscale"), width, height)
+    if scale > 1:
+        total += EST_PER_MPXS * mpx * (scale * scale - 1) * seconds
+    refine = params.get("latent_refine") or 0
+    if refine:
+        total += render(seconds, max(round(steps * refine), 1),
+                        mpx * scale * scale) - EST_PER_MPXS * mpx * scale * scale * seconds
+    return max(round(EST_FIXED + total), 1)
+
+
+def upscale_factor(value, width, height):
+    """The linear scale a latent_upscale request asks for, 1 when none."""
+    if not value:
+        return 1.0
+    if isinstance(value, (int, float)):
+        return float(value)
+    if value.get("scale"):
+        return float(value["scale"])
+    if value.get("width") and value.get("height"):
+        return max(value["width"] / width, value["height"] / height)
+    if value.get("megapixels"):
+        return (value["megapixels"] * 1e6 / (width * height)) ** 0.5
+    return 1.0
 
 
 # The upstream probe runs on its own thread, never inside a request. A
@@ -1220,13 +1735,26 @@ def service_status(lang="en"):
                               ("name", "label", "steps", "tasks")}
                              if REQUEST_LORA else None),
             "duration_min": DURATION_MIN, "duration_max": DURATION_MAX,
+            # Which request features the form should offer. Each needs a
+            # current vLLM-Omni; guides and upscale are also opt in.
+            "features": {"long": VLLM_FEATURES, "edit": VLLM_FEATURES,
+                         "lock": VLLM_FEATURES,
+                         "guides": VLLM_FEATURES and TIMELINE_GUIDES,
+                         "upscale": VLLM_FEATURES and LATENT_UPSCALE,
+                         "cancel_running": ASYNC_JOBS and "vllm-omni" in KINDS_PRESENT,
+                         "preencode": PREENCODE_MP4},
+            "long_max": {"full": LONG_FULL_MAX,
+                         "continuation": LONG_CONTINUATION_MAX},
+            "continuation": {"window": CONTINUATION_WINDOW,
+                             "overlap": CONTINUATION_OVERLAP},
+            "guide_max": GUIDE_MAX,
             "est": {"fixed": EST_FIXED, "per_mpxs": EST_PER_MPXS,
                     "per_mpxs_step": EST_PER_MPXS_STEP,
                     "per_mpxs2_step": EST_PER_MPXS2_STEP},
             "labels": TASK_LABELS.get(lang, TASK_LABELS["en"])}
     with JOBS_LOCK:
         busy_bases = {j.get("backend") for j in JOBS.values()
-                      if j.get("state") == "running"}
+                      if j.get("state") in ACTIVE_STATES}
         waiting = len(JOB_QUEUE)
     backends = [backend_view(api_base, busy_bases) for api_base in API_BASES]
     live = [b for b in backends if b["state"] == "online"]
@@ -1322,9 +1850,12 @@ def parse_generate(payload, lang="en"):
                          tasks=PARTITION["tasks"]))
 
     duration = number(payload, "duration", DURATION_MIN, lang, "duration_number")
-    if not DURATION_MIN <= duration <= DURATION_MAX:
-        raise Rejected(t(lang, "duration_range", lo=DURATION_MIN,
-                         hi=DURATION_MAX))
+    long_video = parse_long_video(payload.get("long_video"), task, duration, lang)
+    hi = long_video_max(task, long_video["mode"]) if long_video else DURATION_MAX
+    if not DURATION_MIN <= duration <= hi:
+        if duration > hi and not long_video and VLLM_FEATURES:
+            raise Rejected(t(lang, "long_needed"))
+        raise Rejected(t(lang, "duration_range", lo=DURATION_MIN, hi=hi))
 
     turbo = bool(payload.get("turbo"))
     if turbo:
@@ -1377,6 +1908,12 @@ def parse_generate(payload, lang="en"):
     if turbo:
         steps = REQUEST_LORA["steps"]
 
+    lock = bool(payload.get("lock_audio"))
+    if lock:
+        require_feature(True, lang, "lock", "")
+        if task != "ref2va" or not audio:
+            raise Rejected(t(lang, "lock_source"))
+
     params = {
         "task": task,
         "prompt": prompt,
@@ -1408,6 +1945,15 @@ def parse_generate(payload, lang="en"):
         if value:
             params[key] = value
 
+    if long_video:
+        params["long_video"] = long_video
+    if lock:
+        params["audio_mode"] = "lock_source"
+    parse_upscale(payload, params, lang)
+    parse_edit(payload, params, media, lang)
+    parse_guides(payload, params, media, lang)
+    check_conflicts(params, lang)
+
     # Queued work nobody can take would wait forever, so say so now. Only a
     # FastVideo-only fleet can get here: vLLM-Omni's bounds are the form's.
     if not any(can_serve(kind, params) for kind in KINDS_PRESENT):
@@ -1415,6 +1961,218 @@ def parse_generate(payload, lang="en"):
         raise Rejected(t(lang, "no_upstream",
                          reason=t(lang, "reason_fastvideo", lo=lo, hi=hi)))
     return params, media
+
+
+# Whether any configured box speaks the current vLLM-Omni contract, which every
+# request feature below needs.
+VLLM_FEATURES = CURRENT and "vllm-omni" in KINDS_PRESENT
+
+
+def require_feature(enabled, lang, name, key):
+    if not VLLM_FEATURES:
+        raise Rejected(t(lang, "feature_contract", feature=feature(lang, name)))
+    if not enabled:
+        raise Rejected(t(lang, "feature_off", feature=feature(lang, name), key=key))
+
+
+def fraction(value, lang, message, low=0.0, high=1.0, low_open=False):
+    """A number within bounds, or Rejected."""
+    if isinstance(value, bool):
+        raise Rejected(t(lang, message, **BOUNDS))
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        raise Rejected(t(lang, message, **BOUNDS)) from None
+    if result != result or result > high or result < low or (
+            low_open and result == low):
+        raise Rejected(t(lang, message, **BOUNDS))
+    return result
+
+
+BOUNDS = {"lo": UPSCALE_RANGE[0], "hi": UPSCALE_RANGE[1]}
+
+
+def parse_long_video(raw, task, duration, lang):
+    """{"mode", "window", "overlap", "prompts"} for a long render, or None.
+
+    The mode defaults the way the server's does: continuation for Ref2VA,
+    full for everything else, where continuation is refused. Prompts, if any,
+    have to come one per window, so the window count is worked out here from
+    the same grid the server plans on.
+    """
+    if not raw:
+        return None
+    require_feature(True, lang, "long", "")
+    raw = raw if isinstance(raw, dict) else {}
+    mode = raw.get("mode") or ("continuation" if task == "ref2va" else "full")
+    if mode not in ("full", "continuation") or (
+            mode == "continuation" and task != "ref2va"):
+        raise Rejected(t(lang, "long_mode"))
+    result = {"mode": mode}
+    if mode != "continuation":
+        return result
+    lo, hi = CONTINUATION_WINDOW_RANGE
+    window = whole_number(raw, "window", None, lang)
+    overlap = whole_number(raw, "overlap", None, lang)
+    w = window or CONTINUATION_WINDOW
+    o = overlap or CONTINUATION_OVERLAP
+    if w % 17 != 5 or o % 17 != 5 or not lo <= w <= hi or w <= o:
+        raise Rejected(t(lang, "long_window", lo=lo, hi=hi))
+    for key, value in (("window", window), ("overlap", overlap)):
+        if value:
+            result[key] = value
+    prompts = raw.get("prompts") or []
+    if not isinstance(prompts, list):
+        prompts = []
+    prompts = [str(p).strip() for p in prompts if str(p).strip()]
+    if prompts:
+        count = continuation_windows(frame_count(duration, 24), w, o)
+        if len(prompts) != count:
+            raise Rejected(t(lang, "long_prompts", n=count))
+        result["prompts"] = prompts
+    return result
+
+
+def parse_upscale(payload, params, lang):
+    """latent_upscale (a scale factor) and latent_refine (a strength)."""
+    scale, refine = payload.get("latent_upscale"), payload.get("latent_refine")
+    if not scale and not refine:
+        return
+    require_feature(LATENT_UPSCALE, lang, "upscale" if scale else "refine",
+                    "H3_LATENT_UPSCALE")
+    if scale:
+        value = fraction(scale, lang, "upscale_number", *UPSCALE_RANGE)
+        if value > 1:
+            params["latent_upscale"] = value
+    if refine:
+        params["latent_refine"] = fraction(refine, lang, "upscale_number",
+                                           low_open=True)
+
+
+def parse_edit(payload, params, media, lang):
+    """A latent edit: which share of the source to regenerate, and where.
+
+    {"video": s, "audio": s, "start": seconds, "end": seconds}. Each strength
+    is how much to regenerate, 0 keeping the source and 1 replacing it. The
+    masks are built here because the server's grid depends on the canvas,
+    which is why an edit needs an explicit one.
+    """
+    raw = payload.get("edit")
+    sources = media.get("source_video") or media.get("source_audio")
+    if not raw:
+        if sources:
+            raise Rejected(t(lang, "edit_sources_only"))
+        return
+    require_feature(True, lang, "edit", "")
+    if not isinstance(raw, dict):
+        raise Rejected(t(lang, "edit_number"))
+    if not params["width"] or not params["height"]:
+        raise Rejected(t(lang, "edit_canvas"))
+    edit = {}
+    for key in ("video", "audio"):
+        edit[key] = fraction(raw.get(key, 1.0), lang, "edit_number")
+    for key in ("start", "end"):
+        value = raw.get(key)
+        edit[key] = None if value in (None, "") else fraction(
+            value, lang, "edit_number", 0.0, params["duration"])
+    if edit["start"] is not None and edit["end"] is not None \
+            and edit["end"] <= edit["start"]:
+        raise Rejected(t(lang, "edit_number"))
+    params["edit"] = edit
+    masks = edit_masks(params)
+    if not masks:
+        raise Rejected(t(lang, "edit_noop"))
+    if "video" in masks and not media.get("source_video"):
+        raise Rejected(t(lang, "edit_source_video"))
+    if "audio" in masks and not sources:
+        raise Rejected(t(lang, "edit_source_audio"))
+    params["edit_masks"] = sorted(masks)
+
+
+def parse_guides(payload, params, media, lang):
+    """Timeline guides: a picture, a clip or audio pinned to a moment.
+
+    [{"at": seconds, "visual": n, "audio": n}], where n indexes the uploaded
+    guide files. A negative position counts back from the end, as the server's
+    frame_index does. The server packs a clip on the 17n+5 grid and checks it
+    fits; a still only has to land inside the clip, which is checked here.
+    """
+    raw = payload.get("guides") or []
+    files = media.get("guide_files") or []
+    if not raw and not files:
+        return
+    require_feature(TIMELINE_GUIDES, lang, "guides", "H3_TIMELINE_GUIDES")
+    if not isinstance(raw, list) or not raw:
+        raise Rejected(t(lang, "guide_shape"))
+    if len(raw) > GUIDE_MAX:
+        raise Rejected(t(lang, "guide_count", n=GUIDE_MAX))
+    frames = frame_count(params["duration"], params["fps"])
+    used, guides = set(), []
+    for number_, entry in enumerate(raw, 1):
+        if not isinstance(entry, dict):
+            raise Rejected(t(lang, "guide_shape"))
+        at = entry.get("at")
+        try:
+            at = float(at)
+        except (TypeError, ValueError):
+            raise Rejected(t(lang, "guide_shape")) from None
+        guide = {"at": at,
+                 "frame_index": (int(round(at * params["fps"])) if at >= 0
+                                 else -int(round(-at * params["fps"])))}
+        for slot, kinds in (("visual", ("image", "video")), ("audio", ("audio",))):
+            index = entry.get(slot)
+            if index is None:
+                continue
+            if isinstance(index, bool) or not isinstance(index, int) \
+                    or not 0 <= index < len(files) or index in used:
+                raise Rejected(t(lang, "guide_shape"))
+            mime, blob = files[index]
+            kind = media_kind(mime)
+            if kind not in kinds:
+                raise Rejected(t(lang, "guide_kind", n=number_))
+            if len(blob) > GUIDE_LIMITS[kind]:
+                raise Rejected(t(lang, "guide_size", n=number_, kind=kind,
+                                 mb=GUIDE_LIMITS[kind] >> 20))
+            used.add(index)
+            guide[kind] = index
+        if not any(key in guide for key in ("image", "video", "audio")):
+            raise Rejected(t(lang, "guide_shape"))
+        resolved = guide["frame_index"] + (frames if guide["frame_index"] < 0 else 0)
+        if not 0 <= resolved < frames:
+            raise Rejected(t(lang, "guide_frame", n=number_, secs=at, frames=frames))
+        guides.append(guide)
+    # The server refuses an upload no entry names.
+    if used != set(range(len(files))):
+        raise Rejected(t(lang, "guide_shape"))
+    params["guides"] = guides
+
+
+def check_conflicts(params, lang):
+    """Refuse the combinations upstream refuses, before they take a GPU.
+
+    Guides want base weights and the native path; refine is a second
+    request-mode pass that continuation and editing cannot share; a locked
+    soundtrack and an audio mask both claim the audio rows.
+    """
+    on = {"turbo": bool(params.get("lora")),
+          "adapter": bool(PARTITION["adapter"]),
+          "continuation": (params.get("long_video") or {}).get("mode") == "continuation",
+          "edit": bool(params.get("edit")),
+          "guides": bool(params.get("guides")),
+          "upscale": bool(params.get("latent_upscale")),
+          "refine": bool(params.get("latent_refine")),
+          "lock": bool(params.get("audio_mode"))}
+    pairs = [("guides", other) for other in
+             ("turbo", "adapter", "continuation", "edit", "upscale", "refine", "lock")]
+    pairs += [("refine", "continuation"), ("refine", "edit"),
+              ("edit", "continuation")]
+    for a, b in pairs:
+        if on[a] and on[b]:
+            raise Rejected(t(lang, "conflict", a=feature(lang, a),
+                             b=feature(lang, b)))
+    if on["lock"] and "audio" in params.get("edit_masks", ()):
+        raise Rejected(t(lang, "conflict", a=feature(lang, "lock"),
+                         b=feature(lang, "edit")))
 
 
 class Server(ThreadingHTTPServer):
@@ -1527,7 +2285,7 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 self._send(404, json.dumps({"error": "unknown job"}))
                 return
-            if job.get("state") == "running":
+            if job.get("state") in ACTIVE_STATES:
                 job["elapsed"] = time.time() - job["started"]
             if job["id"] in positions:
                 job["position"] = positions[job["id"]]
@@ -1638,7 +2396,7 @@ class Handler(BaseHTTPRequestHandler):
         """Answer a cancel or a forget: 404, 200, or 409 naming the state."""
         if state is None:
             self._send(404, json.dumps({"error": "unknown job"}))
-        elif state == success:
+        elif state in (success if isinstance(success, tuple) else (success,)):
             self._send(200, json.dumps({"id": job_id, "state": state}))
         else:
             self._send(409, json.dumps(
@@ -1686,8 +2444,8 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get("Content-Length", "0") != "0":
                 self.close_connection = True
             job_id = path[len("/api/job/"):-len("/cancel")]
-            self.job_action(job_id, cancel_job(job_id), "cancelled",
-                            "cancel_state")
+            self.job_action(job_id, cancel_job(job_id),
+                            ("cancelled", "cancelling"), "cancel_state")
             return
         if path != "/api/generate":
             self._refuse(404, "not found")
@@ -1850,6 +2608,14 @@ INDEX_HTML = r"""<!doctype html>
   fieldset { border: 1px solid var(--line); border-radius: 10px; padding: 14px;
     margin: 16px 0 0; }
   legend { font-size: 12px; color: var(--muted); padding: 0 6px; }
+  .toggle.legend { margin: 0; }
+  .dice.add { margin-top: 10px; padding: 6px 12px; font-size: 12px; font-weight: 400; }
+  .guide { display: grid; grid-template-columns: 74px 1fr 1fr auto; gap: 8px;
+    align-items: end; margin-top: 8px; }
+  .guide label { margin-top: 0; }
+  .guide .x { width: auto; margin: 0; padding: 7px 9px; font-size: 12px;
+    background: transparent; color: var(--muted); border: 1px solid var(--line); }
+  @media (max-width: 480px) { .guide { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
@@ -1909,7 +2675,56 @@ INDEX_HTML = r"""<!doctype html>
         <label for="f-video" data-i18n="att.video"></label>
         <input id="f-video" type="file" accept="video/*" multiple>
       </div>
+      <label class="toggle" id="lock-wrap" style="display:none"><input id="lock" type="checkbox"><span data-i18n="lock.toggle"></span></label>
       <p class="hint" id="att-rule"></p>
+    </fieldset>
+
+    <fieldset id="long-wrap" style="display:none">
+      <legend><label class="toggle legend"><input id="long" type="checkbox"><span data-i18n="long.toggle"></span></label></legend>
+      <div id="long-body" style="display:none">
+        <div id="long-mode-wrap">
+          <label for="long-mode" data-i18n="long.mode"></label>
+          <select id="long-mode">
+            <option value="continuation" data-i18n="long.continuation"></option>
+            <option value="full" data-i18n="long.full"></option>
+          </select>
+        </div>
+        <div id="long-cont">
+          <div class="row">
+            <div><label for="long-window" data-i18n="long.window"></label><input id="long-window" type="number" step="17" min="107" max="345" placeholder="277"></div>
+            <div><label for="long-overlap" data-i18n="long.overlap"></label><input id="long-overlap" type="number" step="17" min="5" placeholder="22"></div>
+          </div>
+          <label for="long-prompts" data-i18n="long.prompts"></label>
+          <textarea id="long-prompts" class="short"></textarea>
+        </div>
+        <p class="hint" id="long-hint"></p>
+      </div>
+    </fieldset>
+
+    <fieldset id="edit-wrap" style="display:none">
+      <legend><label class="toggle legend"><input id="edit" type="checkbox"><span data-i18n="edit.toggle"></span></label></legend>
+      <div id="edit-body" style="display:none">
+        <label for="f-source-video" data-i18n="edit.video"></label>
+        <input id="f-source-video" type="file" accept="video/mp4,video/quicktime,.mp4,.mov">
+        <label for="f-source-audio" data-i18n="edit.audio"></label>
+        <input id="f-source-audio" type="file" accept="audio/wav,audio/mpeg,.wav,.mp3">
+        <div class="row">
+          <div><label for="edit-vs" data-i18n="edit.vstrength"></label><input id="edit-vs" type="number" min="0" max="1" step="0.05" value="1"></div>
+          <div><label for="edit-as" data-i18n="edit.astrength"></label><input id="edit-as" type="number" min="0" max="1" step="0.05" value="0"></div>
+        </div>
+        <div class="row">
+          <div><label for="edit-from" data-i18n="edit.from"></label><input id="edit-from" type="number" min="0" step="0.1"></div>
+          <div><label for="edit-to" data-i18n="edit.to"></label><input id="edit-to" type="number" min="0" step="0.1"></div>
+        </div>
+        <p class="hint" data-i18n="edit.hint"></p>
+      </div>
+    </fieldset>
+
+    <fieldset id="guide-wrap" style="display:none">
+      <legend data-i18n="guide.legend"></legend>
+      <div id="guides"></div>
+      <button type="button" class="dice add" id="guide-add" data-i18n="guide.add"></button>
+      <p class="hint" data-i18n="guide.hint"></p>
     </fieldset>
 
     <label for="preset" data-i18n="label.resolution"></label>
@@ -1938,6 +2753,15 @@ INDEX_HTML = r"""<!doctype html>
           <button type="button" class="dice" id="dice" data-i18n-title="dice.title">🎲</button>
         </div>
       </div>
+    </div>
+    <div class="row" id="up-row" style="display:none">
+      <div><label for="upscale" data-i18n="up.scale"></label>
+        <select id="upscale">
+          <option value="" data-i18n="up.off"></option>
+          <option value="1.5">1.5×</option>
+          <option value="2">2×</option>
+        </select></div>
+      <div><label for="refine" data-i18n="up.refine"></label><input id="refine" type="number" min="0" max="1" step="0.05" value="0"></div>
     </div>
     <label class="toggle" id="turbo-wrap" style="display:none"><input id="turbo" type="checkbox"><span id="turbo-label"></span></label>
     <label class="toggle"><input id="rand" type="checkbox"><span data-i18n="opt.random"></span></label>
@@ -2050,7 +2874,37 @@ const STRINGS = {
     "stat.sending": "Submitted, queueing…",
     "stat.queued": "Queued — {n} job(s) ahead of it.",
     "stat.next": "Queued — starting shortly.",
-    "align.hint": "Prepended automatically: Picture 1 (from Shot 1) → 0.00 s; Picture 2 (from Shot {shot}) → {secs} s"
+    "align.hint": "Prepended automatically: Picture 1 (from Shot 1) → 0.00 s; Picture 2 (from Shot {shot}) → {secs} s",
+    "lock.toggle": "Drive the clip with this audio (keep it as the soundtrack)",
+    "long.toggle": "Long video (over 15 s)",
+    "long.mode": "Long video mode",
+    "long.continuation": "Continuation: render in windows, up to 300 s",
+    "long.full": "Full: the whole clip at once, up to 30 s",
+    "long.window": "Window (frames)",
+    "long.overlap": "Overlap (frames)",
+    "long.prompts": "Per-window prompts (optional, separated by a line of ---)",
+    "long.hint.cont": "{f} frames in {n} windows. Per-window prompts: give {n}, or none to reuse the prompt.",
+    "long.hint.full": "{f} frames sampled at once. Memory grows with the whole clip.",
+    "edit.toggle": "Edit an existing clip (latent mask)",
+    "edit.video": "Source video (.mp4 or .mov)",
+    "edit.audio": "Source audio (optional; otherwise the video's own track)",
+    "edit.vstrength": "Picture: regenerate 0 to 1",
+    "edit.astrength": "Sound: regenerate 0 to 1",
+    "edit.from": "From (s, optional)",
+    "edit.to": "To (s, optional)",
+    "edit.hint": "0 keeps the source, 1 replaces it. With a time range, the strengths apply inside it and everything outside is kept.",
+    "guide.legend": "Timeline guides",
+    "guide.add": "Add a guide",
+    "guide.at": "At (s)",
+    "guide.visual": "Image or clip",
+    "guide.audio": "Audio",
+    "guide.hint": "Pin a picture, a clip or audio to a moment; a negative time counts back from the end. Base weights only: no Turbo, editing or upscale.",
+    "up.scale": "Latent upscale",
+    "up.off": "Off",
+    "up.refine": "Refine strength (0 = off)",
+    "state.cancelling": "cancelling",
+    "job.server_queued": " · waiting on the server",
+    "job.cancelling": " · stopping at the next step"
   },
   zh: {
     "lang.other": "English",
@@ -2134,7 +2988,37 @@ const STRINGS = {
     "stat.sending": "已送出，排隊中…",
     "stat.queued": "已加入佇列，前面還有 {n} 個任務。",
     "stat.next": "已加入佇列，即將開始。",
-    "align.hint": "會自動加在最前面：Picture 1 (from Shot 1) → 0.00 秒；Picture 2 (from Shot {shot}) → {secs} 秒"
+    "align.hint": "會自動加在最前面：Picture 1 (from Shot 1) → 0.00 秒；Picture 2 (from Shot {shot}) → {secs} 秒",
+    "lock.toggle": "以這段音訊驅動影片（保留為音軌）",
+    "long.toggle": "長片（超過 15 秒）",
+    "long.mode": "長片模式",
+    "long.continuation": "續寫：分視窗生成，最長 300 秒",
+    "long.full": "整段：一次生成整支，最長 30 秒",
+    "long.window": "視窗（格）",
+    "long.overlap": "重疊（格）",
+    "long.prompts": "逐段 prompt（選填，以一行 --- 分隔）",
+    "long.hint.cont": "共 {f} 格，切成 {n} 個視窗。逐段 prompt 請給 {n} 段，或留空沿用同一段 prompt。",
+    "long.hint.full": "共 {f} 格，一次取樣。記憶體用量隨整支片長成長。",
+    "edit.toggle": "編輯既有片段（latent 遮罩）",
+    "edit.video": "來源影片（.mp4 或 .mov）",
+    "edit.audio": "來源音訊（選填，否則用影片本身的音軌）",
+    "edit.vstrength": "畫面：重新生成 0 到 1",
+    "edit.astrength": "聲音：重新生成 0 到 1",
+    "edit.from": "起點（秒，選填）",
+    "edit.to": "終點（秒，選填）",
+    "edit.hint": "0 保留來源，1 完全取代。指定時間範圍時，強度只套用在範圍內，範圍外一律保留。",
+    "guide.legend": "Timeline guides",
+    "guide.add": "新增 guide",
+    "guide.at": "位置（秒）",
+    "guide.visual": "圖片或短片",
+    "guide.audio": "音訊",
+    "guide.hint": "把圖片、短片或音訊釘在某個時間點；負數表示從結尾倒數。只能用原始權重，不能搭配 Turbo、編輯或放大。",
+    "up.scale": "Latent 放大",
+    "up.off": "關閉",
+    "up.refine": "精修強度（0 為關閉）",
+    "state.cancelling": "取消中",
+    "job.server_queued": " · 在伺服器端等待",
+    "job.cancelling": " · 會在下一步停下"
   }
 };
 
@@ -2191,6 +3075,19 @@ let LORA = null, PINNED = 0, LOCKED = false, ADAPTER = null;
 // the number back rather than leaving the adapter's behind.
 let STEPS_BEFORE = null;
 let CONSTRAINTS = "";
+// Request features the server side offers, from /api/status.
+let FEATURES = {}, LONG_MAX = {full: 30, continuation: 300}, DUR_MAX = 15;
+let CONT = {window: 277, overlap: 22}, GUIDE_MAX = 8;
+
+// The same grid the server plans on: frames snap up to 17n+5, and a
+// continuation window after the first starts window - overlap frames on.
+const snapFrames = secs => { const r = Math.max(Math.round(secs * 24), 5); return r + ((5 - r) % 17 + 17) % 17; };
+function contWindows(frames) {
+  const w = +$("long-window").value || CONT.window, o = +$("long-overlap").value || CONT.overlap;
+  return frames <= w ? 1 : 1 + Math.ceil((frames - w) / Math.max(w - o, 1));
+}
+const longMode = () => $("task").value === "ref2va" ? $("long-mode").value : "full";
+const longOn = () => !!FEATURES.long && $("long").checked;
 
 function dims() {
   const p = $("preset").value;
@@ -2199,13 +3096,30 @@ function dims() {
   const [w, h] = p.split("x");
   return [+w, +h];
 }
+// The server's estimate_seconds(), in the browser: continuation pays attention
+// per window, and an upscale or refine is the same model on the larger canvas.
 function estimate() {
   const [w, h] = dims();
-  const steps = +$("steps").value;
-  const x = (w || 1344) * (h || 768) / 1e6 * (+$("duration").value);
-  const secs = EST.fixed + EST.per_mpxs * x + EST.per_mpxs_step * x * steps +
-               EST.per_mpxs2_step * x * x * steps;
-  $("est").textContent = tr("est", {t: fmt(Math.max(secs, 1))});
+  const steps = +$("steps").value, dur = +$("duration").value;
+  const mpx = (w || 1344) * (h || 768) / 1e6;
+  const render = (s, n, area = mpx) => {
+    const x = area * s;
+    return EST.per_mpxs * x + EST.per_mpxs_step * x * n + EST.per_mpxs2_step * x * x * n;
+  };
+  let secs;
+  if (longOn() && longMode() === "continuation") {
+    const n = contWindows(snapFrames(dur)), span = (+$("long-window").value || CONT.window) / 24;
+    secs = n * render(span, steps) - (n * span - dur) * EST.per_mpxs * mpx;
+  } else {
+    secs = render(dur, steps);
+  }
+  if (FEATURES.upscale) {
+    const k = +$("upscale").value || 1, r = +$("refine").value || 0;
+    if (k > 1) secs += EST.per_mpxs * mpx * (k * k - 1) * dur;
+    if (r > 0) secs += render(dur, Math.max(Math.round(steps * r), 1), mpx * k * k)
+                       - EST.per_mpxs * mpx * k * k * dur;
+  }
+  $("est").textContent = tr("est", {t: fmt(Math.max(EST.fixed + secs, 1))});
 }
 function syncTask() {
   const t = $("task").value;
@@ -2214,9 +3128,49 @@ function syncTask() {
   $("att-audio").style.display = t === "ref2va" ? "block" : "none";
   $("att-video").style.display = t === "ref2va" ? "block" : "none";
   $("att-rule").textContent = RULES[t] ? tr(RULES[t]) : "";
-  estimate();
+  syncFeatures();
   syncAlignHint();
 }
+
+// Show the feature panels this server offers, for this mode. Continuation is
+// Ref2VA's only; a long clip in any other mode renders in full.
+function syncFeatures() {
+  const t = $("task").value, show = (id, on) => { $(id).style.display = on ? "" : "none"; };
+  show("lock-wrap", FEATURES.lock && t === "ref2va");
+  show("long-wrap", FEATURES.long);
+  show("long-body", longOn());
+  show("long-mode-wrap", t === "ref2va");
+  show("long-cont", longMode() === "continuation");
+  show("edit-wrap", FEATURES.edit);
+  show("edit-body", FEATURES.edit && $("edit").checked);
+  show("guide-wrap", FEATURES.guides);
+  show("up-row", FEATURES.upscale);
+  const max = longOn() ? LONG_MAX[longMode()] : DUR_MAX;
+  $("duration").max = max;
+  if (+$("duration").value > max) $("duration").value = max;
+  const frames = snapFrames(+$("duration").value);
+  $("long-hint").textContent = longMode() === "continuation"
+    ? tr("long.hint.cont", {f: frames, n: contWindows(frames)})
+    : tr("long.hint.full", {f: frames});
+  estimate();
+}
+["long", "long-mode", "edit"].forEach(id => $(id).addEventListener("change", syncFeatures));
+["long-window", "long-overlap", "duration"].forEach(id => $(id).addEventListener("input", syncFeatures));
+["upscale", "refine"].forEach(id => $(id).addEventListener("input", estimate));
+
+function addGuide() {
+  if ($("guides").children.length >= GUIDE_MAX) return;
+  const row = document.createElement("div");
+  row.className = "guide";
+  row.innerHTML = `
+    <div><label>${tr("guide.at")}</label><input class="g-at" type="number" step="0.1" value="0"></div>
+    <div><label>${tr("guide.visual")}</label><input class="g-vis" type="file" accept="image/*,video/mp4,video/quicktime,.mp4,.mov"></div>
+    <div><label>${tr("guide.audio")}</label><input class="g-aud" type="file" accept="audio/wav,audio/mpeg,audio/flac,.wav,.mp3,.flac"></div>
+    <button type="button" class="x">✕</button>`;
+  row.querySelector(".x").onclick = () => row.remove();
+  $("guides").appendChild(row);
+}
+$("guide-add").onclick = addGuide;
 $("task").onchange = syncTask;
 
 // What the upstream will and will not accept, applied from /api/status. The
@@ -2225,10 +3179,15 @@ $("task").onchange = syncTask;
 function applyConstraints(s) {
   const sig = JSON.stringify([s.pinned_steps, s.locked_shifts, s.adapter,
                               s.est, s.duration_min, s.duration_max,
-                              s.request_lora]);
+                              s.request_lora, s.features, s.long_max]);
   if (sig === CONSTRAINTS) return;
   CONSTRAINTS = sig;
   if (s.est) EST = s.est;
+  FEATURES = s.features || {};
+  if (s.long_max) LONG_MAX = s.long_max;
+  if (s.continuation) CONT = s.continuation;
+  if (s.guide_max) GUIDE_MAX = s.guide_max;
+  if (s.duration_max != null) DUR_MAX = s.duration_max;
 
   // A request-switchable adapter is offered rather than imposed: the checkbox
   // appears, and syncTurbo() applies its schedule only when it is ticked.
@@ -2255,8 +3214,7 @@ function applyConstraints(s) {
     $("duration").min = s.duration_min;
     if (+$("duration").value < s.duration_min) $("duration").value = s.duration_min;
   }
-  if (s.duration_max != null) $("duration").max = s.duration_max;
-  estimate();
+  syncFeatures();
   syncAlignHint();
   syncTurbo();
 }
@@ -2409,7 +3367,7 @@ async function loadHistory() {
         onclick="show('${i.file}')"></video>
       <div onclick="show('${i.file}')">${esc(i.task || "t2va")} ·
         ${esc(i.width || "auto")}×${esc(i.height || "auto")} ·
-        ${esc(i.steps)} steps · seed ${esc(i.seed)}<br>${fmt(+i.elapsed || 0)}${
+        ${esc(i.steps)} steps · seed ${esc(i.seed)}${esc(featureTags(i))}<br>${fmt(+i.elapsed || 0)}${
         Array.isArray(i.attached) && i.attached.length
           ? " · " + tr("hist.attached") + esc(i.attached.join(",")) : ""}</div>
     </div>`).join("") || `<p class="hint">${tr("hist.empty")}</p>`;
@@ -2486,8 +3444,22 @@ function esc(s) {
 const STATE_TAG = {
   queued: ["", "state.queued"], running: ["run", "state.running"],
   done: ["", "state.done"], failed: ["bad", "state.failed"],
-  cancelled: ["", "state.cancelled"]
+  cancelled: ["", "state.cancelled"], cancelling: ["run", "state.cancelling"]
 };
+const ACTIVE = ["queued", "running", "cancelling"];
+
+// What a result asked for beyond the plain render, for the card and queue.
+function featureTags(p) {
+  const tags = [];
+  if (p.lora) tags.push("turbo");
+  if (p.long_video) tags.push("long:" + p.long_video.mode);
+  if (p.audio_mode) tags.push("lock");
+  if (p.edit) tags.push("edit");
+  if (p.guides) tags.push("guides " + p.guides.length);
+  if (p.latent_upscale) tags.push("↑" + p.latent_upscale + "×");
+  if (p.latent_refine) tags.push("refine " + p.latent_refine);
+  return tags.length ? " · " + tags.join(" · ") : "";
+}
 
 // null until the first poll: without it, every job already finished before the
 // page opened would be treated as newly done and yank the player around.
@@ -2515,17 +3487,21 @@ async function loadQueue() {
     }
   }
 
-  const pending = jobs.filter(j => j.state === "queued" || j.state === "running");
+  const pending = jobs.filter(j => ACTIVE.includes(j.state));
   const shown = pending.length ? pending
     : jobs.slice(0, 3);   // nothing waiting: keep the last few for context
   let html = shown.map(j => {
     const [cls, key] = STATE_TAG[j.state] || ["", null];
     const text = key ? tr(key) : j.state;
     const p = j.params || {};
-    let sub = esc(`${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`);
-    if (j.state === "running")
+    let sub = esc(`${p.task || "t2va"} · ${p.steps} steps · ${p.duration}s · seed ${p.seed}`
+                  + featureTags(p));
+    if (j.state === "running" || j.state === "cancelling") {
       sub += tr("job.progress",
                 {done: fmt(j.elapsed || 0), est: fmt(j.estimate || 0)});
+      if (j.state === "cancelling") sub += tr("job.cancelling");
+      else if (j.remote_status === "queued") sub += tr("job.server_queued");
+    }
     else if (j.state === "queued") sub += tr("job.position", {n: j.position || "?"});
     else if (j.state === "done") sub += ` · ${fmt(j.elapsed || 0)}`;
     else if (j.state === "failed") sub = esc((j.error || "").split("\n")[0]).slice(0, 120);
@@ -2537,7 +3513,7 @@ async function loadQueue() {
       <span class="txt">
         <span class="line">${esc(p.description || p.prompt) || tr("job.noprompt")}</span>
         <span class="line sub">${sub}</span></span>
-      ${j.state === "queued"
+      ${j.state === "queued" || (j.state === "running" && j.cancellable)
         ? `<button class="x" onclick="event.stopPropagation();cancelJob('${j.id}')">${
              tr("btn.cancel")}</button>`
         : ""}
@@ -2647,6 +3623,45 @@ $("go").onclick = async () => {
     if ($("f-video").files.length && $("att-video").style.display !== "none")
       attachments.videos = await Promise.all([...$("f-video").files].map(toDataUrl));
 
+    // Each panel only sends what it is showing, so a hidden or unticked one
+    // never rides along on a request it was not meant for.
+    const extras = {};
+    if (FEATURES.lock && $("task").value === "ref2va" && $("lock").checked)
+      extras.lock_audio = true;
+    if (longOn()) {
+      const prompts = $("long-prompts").value.split(/^\s*---\s*$/m)
+        .map(p => p.trim()).filter(Boolean);
+      extras.long_video = {mode: longMode()};
+      if (longMode() === "continuation") Object.assign(extras.long_video, {
+        window: +$("long-window").value || null,
+        overlap: +$("long-overlap").value || null, prompts});
+    }
+    if (FEATURES.edit && $("edit").checked) {
+      const num = id => $(id).value.trim() === "" ? null : +$(id).value;
+      extras.edit = {video: num("edit-vs") ?? 1, audio: num("edit-as") ?? 1,
+                     start: num("edit-from"), end: num("edit-to")};
+      if ($("f-source-video").files[0])
+        attachments.source_video = await toDataUrl($("f-source-video").files[0]);
+      if ($("f-source-audio").files[0])
+        attachments.source_audio = await toDataUrl($("f-source-audio").files[0]);
+    }
+    if (FEATURES.guides) {
+      const files = [], guides = [];
+      for (const row of $("guides").children) {
+        const entry = {at: +row.querySelector(".g-at").value || 0};
+        for (const [cls, slot] of [[".g-vis", "visual"], [".g-aud", "audio"]]) {
+          const f = row.querySelector(cls).files[0];
+          if (f) { entry[slot] = files.length; files.push(await toDataUrl(f)); }
+        }
+        if ("visual" in entry || "audio" in entry) guides.push(entry);
+      }
+      if (guides.length) { extras.guides = guides; attachments.guide_files = files; }
+    }
+    if (FEATURES.upscale) {
+      if (+$("upscale").value > 1) extras.latent_upscale = +$("upscale").value;
+      if (+$("refine").value > 0) extras.latent_refine = +$("refine").value;
+    }
+
     if ($("rand").checked) rollSeed();
 
     // A locked schedule rejects a request that names either shift, so the page
@@ -2663,7 +3678,7 @@ $("go").onclick = async () => {
       body: JSON.stringify({
         task: $("task").value, ...text, width, height,
         steps: +$("steps").value, duration: +$("duration").value,
-        fps: +$("fps").value, ...shifts, turbo, seed, attachments
+        fps: +$("fps").value, ...shifts, turbo, seed, ...extras, attachments
       })
     });
     const {position, error} = await res.json()
@@ -2715,6 +3730,12 @@ if __name__ == "__main__":
         f"  auth: {'on' if API_KEY else 'off'}")
     say(f"partition: {PARTITION['partition']}  tasks: {PARTITION['tasks']}"
         f"  contract: {SERVER_CONTRACT}")
+    if VLLM_FEATURES:
+        on = [name for name, flag in (
+            ("async jobs", ASYNC_JOBS), ("preencode", PREENCODE_MP4),
+            ("timeline guides", TIMELINE_GUIDES),
+            ("latent upscale", LATENT_UPSCALE)) if flag]
+        say(f"features: long video, edit, {', '.join(on) or 'nothing opt in'}")
     if REQUEST_LORA:
         say(f"request lora: {REQUEST_LORA['name']}  steps {REQUEST_LORA['steps']}"
             f"  shifts {REQUEST_LORA['flow_shift']:g}/"

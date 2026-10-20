@@ -14,7 +14,8 @@ It exists because talking to `/v1/videos/sync` by hand is tedious: multipart bod
 
 - **Text, first-frame, and reference conditioning**: the task list is read from the served checkpoint, so the UI matches whatever partition is loaded rather than offering options the server will reject.
 - **Attachment rules enforced before submitting**: each task states what it accepts, and the form refuses mismatched combinations instead of letting the server reject them.
-- **A real queue**: submit as many jobs as you like without waiting. One worker per configured upstream drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled; running ones can't, because the upstream call is synchronous and already on the GPU.
+- **A real queue**: submit as many jobs as you like without waiting. One worker per configured upstream drains them in submission order, so you can line up a batch and walk away. Queued jobs can be cancelled, and on a current vLLM-Omni so can a running one: it stops at the next denoising step.
+- **The rest of what H3 serves**: long video up to 300 seconds, a soundtrack that drives the clip, latent-mask editing of an existing clip, timeline guides and latent upscaling, each refused up front in the combinations the server refuses. See [Request features](#request-features).
 - **Jobs survive the page**: generation runs server-side against a job id, so closing the tab or losing Wi-Fi doesn't kill a ten-minute render. The finished video appears whenever you come back.
 - **Reproducible by default**: every result writes a sidecar JSON beside the video with the parameters you chose and the exact fields that went to the server.
 - **Random seeds**: 🎲 draws one on demand; the checkbox draws a fresh one per generation. Either way the drawn value is written into the seed box and shown on completion, so a lucky result is never lost to a number you can't recover.
@@ -156,15 +157,131 @@ h3-ui reads the same name the same way:
 | `ref2v` | Serves `ref2va`, on a server started with `--task-type ref2va` |
 
 So `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` is 4 steps with
-shifts 6/3 on a current build, and `minimax_h3_ref2v_turbo_8step_v1.0_bf16.safetensors`
-is 8 steps with shifts 12/3, ref2va only. Any `H3_REQUEST_LORA_*` value set
-explicitly still wins over the name. The ComfyUI and fp8 exports do not match
+shifts 6/3 on a current build, and `minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors`
+is 4 steps with shifts 12/3, ref2va only. Any `H3_REQUEST_LORA_*` value set
+explicitly still wins over the name.
+
+One file breaks the rule. `minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors`
+was released with shifts 12/3 ([its release notes](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51)),
+but its name says 768p, so vLLM-Omni reads 6/3 and refuses anything else.
+h3-ui sends what the server accepts. [#7591](https://github.com/vllm-project/vllm-omni/pull/7591)
+corrects the server and is still open as of 2026-10-20; once it lands, set
+`H3_REQUEST_LORA_FLOW_SHIFT=12` for that file. The ComfyUI and fp8 exports do not match
 upstream's pattern and are not served; neither is prefusion or composing more
 than one adapter.
 
 The two are mutually exclusive: a fused server refuses a request that also names
 a LoRA, so h3-ui rejects the combination with a message saying which adapter is
 in the way rather than letting the upstream refuse it.
+
+## Request features
+
+Everything here needs `H3_SERVER_CONTRACT=current`, which is vLLM-Omni v0.30.0
+or later. The form only shows what the configured servers can run, and
+`POST /api/generate` refuses a combination the server would refuse, with a
+message naming both halves, before it takes a GPU.
+
+**The MP4 is encoded on the worker.** Every request asks for `preencode_mp4`
+([#7018](https://github.com/vllm-project/vllm-omni/pull/7018)): the worker
+encodes each VAE chunk while later ones are still decoding, and the API process
+receives finished bytes, so its event loop has nothing to mux. On v0.30.0 that
+mux is no longer the 11.7 s stall it was in August (see
+[below](#a-note-on-long-generations)): for a 1344x768/4 s Turbo clip on a GB10,
+`/v1/models` stopped answering for at most 0.67 s without it and 0.03 s with
+it. The render took as long either way (266 s and 271 s) and the two MP4s came
+back byte for byte the same. Where it matters is length: a long clip never has
+to sit decoded in the API process. `H3_PREENCODE_MP4=0` turns it off.
+
+**Jobs run through the job API, so a running one can be cancelled.** On a
+current vLLM-Omni h3-ui creates a job with `POST /v1/videos`, polls it, fetches
+the file and deletes it from the server, instead of holding one synchronous
+request open. Cancelling a running job sends `DELETE`, and MiniMax-H3 stops at
+the next denoising boundary ([#7844](https://github.com/vllm-project/vllm-omni/pull/7844)).
+The server answers the `DELETE` at once and the GPU stops at the next boundary:
+measured on a GB10, the cancel was confirmed in 2 s and the worker logged the
+stop 10 s later; during a latent refine pass it took 40 s. h3-ui shows the job
+as cancelling until that confirmation. The
+box's next job may be sent in between; it waits on the server until the
+aborted one has let go, which is safe because the server runs one request at a
+time. Server timing and peak memory come from the job record
+rather than response headers. The cost: the job lives on the server, so if
+h3-ui restarts mid-render the server finishes a job nobody collects. It also
+needs a single API server process, which is the default. `H3_ASYNC_JOBS=0`
+goes back to `/v1/videos/sync`.
+
+**Long video** ([#7838](https://github.com/vllm-project/vllm-omni/pull/7838)).
+Above 15 seconds a request has to opt in. Ref2VA then defaults to
+continuation, up to 300 seconds: the clip is sampled in windows of 277 frames
+that overlap by 22, each conditioned on the tail of the last, so denoising
+memory is bounded by the window. Every other mode renders the whole clip at
+once, up to 30 seconds. Window and overlap can be set (17n+5 frames, a window of
+107 to 345), and a continuation can take one prompt per window; the form says
+how many windows the clip has. Continuation asks for `quality=lossless`, since
+it only runs uncached. These limits are the server's sanity bounds, not a
+promise that the canvas fits in memory.
+
+**A soundtrack that drives the clip.** With Ref2VA and a reference audio,
+`audio_mode=lock_source` places the audio in the target and keeps it clean
+through sampling, so the picture follows it rather than treating it as a short
+reference. The returned audio is the VAE's reconstruction of it.
+
+On a current server the reference image and audio go up as two files under
+`input_references`, which H3 sorts by type. Earlier versions of h3-ui put the
+audio in the `audio_reference` field as a data URL, and the server refuses any
+plain form field over 1 MiB, so a track of more than a few seconds came back as
+a reset connection. The older contracts still use the field.
+
+**Latent-mask editing** ([#7465](https://github.com/vllm-project/vllm-omni/pull/7465)).
+Upload a source clip, and optionally a separate source audio, then say how much
+of the picture and of the sound to regenerate, 0 keeping the source and 1
+replacing it, optionally only between two times. A v0.30.0 server reads a video
+mask as a scalar or on its latent token grid, so h3-ui resolves the time range
+onto that grid itself: each latent takes the largest value of the frames it
+covers (the causal VAE folds frame 0 alone and then four frames per latent), so
+any frame the range touches is regenerated. The canvas has to be explicit for
+that, so editing refuses "follow the image". Defaults: regenerate the picture,
+keep the sound.
+
+**Timeline guides** ([#8460](https://github.com/vllm-project/vllm-omni/pull/8460),
+[#8838](https://github.com/vllm-project/vllm-omni/pull/8838)). Pin an image, a
+clip or audio to a moment of the output, up to 8; a negative time counts back
+from the end. They need base weights and the native path, so h3-ui sends
+`quality=lossless` and refuses them with Turbo, a fused or distilled schedule,
+continuation, editing, upscaling and a locked soundtrack. These are on main
+from 2026-10-13 and in v0.32.0rc1, and an older server would drop the fields
+without a word, so they are opt in: `H3_TIMELINE_GUIDES=1`.
+
+**Latent upscale and refine** ([#8322](https://github.com/vllm-project/vllm-omni/pull/8322),
+v0.31.0rc1). The community upscaler enlarges the finished latent before the
+VAE, so the clip decodes once at the larger size, and a refine re-runs that
+share of the steps at the new size to put real detail back (upstream found 0.35
+the best strength; higher values re-generate rather than sharpen). The upscaler
+is a separate 691 MB checkpoint the server has to be started with
+(`--additional-config '{"latent_upscaler_path": ...}'`). Upstream's recipe names
+a file the repository does not have; the one to download is
+`minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors`
+from [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler).
+A refine alone needs no checkpoint. Opt in with `H3_LATENT_UPSCALE=1`. A refine cannot share a request
+with continuation or editing, and the time estimate for both is the same cost
+model on the larger canvas, not a fit.
+
+### Measured on one GB10
+
+One run each on a DGX Spark (GB10), online FP8, at seed 1101, wrapped in a
+thermal guard. Without one, an hour of these back to back powered the box off,
+so leave cooling time between long renders on this hardware.
+
+| Feature | Server | Settings | Time | Result |
+| --- | --- | --- | ---: | --- |
+| Pre-encoded MP4 | v0.30.0 | 1344x768, 4 s, Turbo | 271 s (266 s without) | longest `/v1/models` stall 0.03 s (0.67 s without) |
+| Cancel a running job | v0.30.0 | 768x448, 4 s, 20 steps | confirmed in 2 s | GPU stopped 10 s later; the next job ran in 80 s |
+| Edit: picture 0.5, sound kept | v0.30.0 | 768x448, 4 s, Turbo | 106 s | 35.5 dB PSNR to the source throughout |
+| Edit: regenerate 2 to 3 s | v0.30.0 | 768x448, 4 s, Turbo | 106 s | 37 dB outside the range, 28 dB inside; sound kept |
+| Long video, full | v0.30.0 | t2va 768x448, 20 s, Turbo | 538 s | 481 frames, peak 78 GB |
+| Timeline guides | nightly 2026-10-19 | 768x448, 5 s, 20 steps; image at 2 s, clip at the last second | 381 s | guided frame 33 dB to its image, 24 to 25 dB elsewhere; the clip's effect was not measurable |
+| Latent upscale 2x | nightly 2026-10-19 | 768x448 to 1536x896, 4 s, Turbo | 164 s | |
+| Upscale 1.5x, refine 0.35 | nightly 2026-10-19 | 768x448 to 1152x672, 4 s, 8 steps | 238 s | the same at 20 steps tripped the thermal guard after 8 minutes |
+| Continuation, locked soundtrack | nightly 2026-10-19, Ref2VA | 768x448, 8 s, 8 steps, windows of 107 overlapping 22, two prompts | 262 s | 192 frames in two windows; soundtrack correlates 0.94 with the driving audio |
 
 ### Recalibrating the time estimate
 
@@ -248,6 +365,11 @@ Resolved in order: process environment → `.env` → default.
 | `H3_REQUEST_LORA_TASKS` | *(from the name)* | Tasks the adapter serves: `t2va,fl2va` for `fl2v`, `ref2va` for `ref2v` |
 | `H3_LORA_PATH` | *(empty)* | The adapter the server was started with. Set means FastH3 is fused |
 | `H3_FASTH3` | *(unset)* | Override: a switch (4 on vLLM-Omni, 5 on FastVideo), or the step count to pin, such as `8` for V2 on vLLM-Omni. `0` forces off |
+| `H3_PREENCODE_MP4` | `1` | Ask the server to encode the MP4 on the worker. Current contract only |
+| `H3_PREENCODE_BATCH_FRAMES` | *(server's)* | Frames per worker transfer when pre-encoding |
+| `H3_ASYNC_JOBS` | `1` | Run vLLM-Omni jobs through `/v1/videos` so running ones can be cancelled. `0` uses `/v1/videos/sync` |
+| `H3_TIMELINE_GUIDES` | `0` | Offer timeline guides. Needs v0.32.0rc1 or a nightly from 2026-10-13 |
+| `H3_LATENT_UPSCALE` | `0` | Offer latent upscale and refine. Needs v0.31.0rc1, and the upscaler checkpoint for upscaling |
 | `H3_EST_FIXED_SECONDS` | `0` | Constant term of the time estimate |
 | `H3_EST_PER_MPXS` | `11.88` | Cost per megapixel-second, independent of the step count |
 | `H3_EST_PER_MPXS_STEP` | `6.05` | The part of a step that is linear in tokens |
@@ -312,7 +434,7 @@ Deleting a result unlinks it immediately. There is no trash, and the browser's c
 
 ## Usage notes
 
-**Queue.** Submitting adds to the queue and returns its position; the form stays usable so you can queue several variations at once. The queue panel shows what's waiting, what's running with elapsed against estimated time, and lets you cancel anything that hasn't started.
+**Queue.** Submitting adds to the queue and returns its position; the form stays usable so you can queue several variations at once. The queue panel shows what's waiting, what's running with elapsed against estimated time, and lets you cancel anything that hasn't started, or, on a box that runs the job API, anything still running.
 
 **Reproducing a result.** Every `media/*.mp4` has a `.mp4.json` beside it:
 
@@ -354,7 +476,7 @@ The browser UI is just a client of this. Anything it does, you can script.
 | `POST` | `/api/generate` | Queue a job; returns `{id, position}` |
 | `GET` | `/api/jobs` | Whole queue plus recent finished jobs |
 | `GET` | `/api/job/<id>` | One job's state |
-| `POST` | `/api/job/<id>/cancel` | Cancel a queued job (409 if it already started) |
+| `POST` | `/api/job/<id>/cancel` | Cancel a queued job, or a running one on a job API box (it turns `cancelling` first); 409 otherwise |
 | `DELETE` | `/api/job/<id>` | Remove a finished job from the queue list; the video stays |
 | `DELETE` | `/api/jobs/finished` | Remove every finished job from the queue list |
 | `GET` | `/api/history` | Completed results with their parameters |
@@ -412,9 +534,28 @@ misreport.
 
 Attachments are data URLs: `{"image": "data:image/png;base64,..."}`, or `{"videos": [...]}` for reference conditioning.
 
+The request features take these fields, each refused with a 400 where the
+server would refuse it:
+
+```json
+{
+  "long_video": {"mode": "continuation", "window": 277, "overlap": 22,
+                 "prompts": ["first window", "second window"]},
+  "lock_audio": true,
+  "edit": {"video": 1.0, "audio": 0.0, "start": 2.0, "end": 3.5},
+  "guides": [{"at": 1.5, "visual": 0, "audio": 1}, {"at": -1.0, "visual": 2}],
+  "latent_upscale": 2.0,
+  "latent_refine": 0.35
+}
+```
+
+An edit's clips go in `attachments` as `source_video` and `source_audio`. A
+guide names its files by position in `attachments.guide_files`, and every file
+there has to be used.
+
 ## Scope
 
-The server contract is `POST /v1/videos/sync`, as vLLM-Omni and FastVideo serve it. The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific: a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
+The server contract is `POST /v1/videos/sync` as vLLM-Omni and FastVideo serve it, or vLLM-Omni's job API (`POST /v1/videos`, then `GET` and `DELETE` on the job). The **task vocabulary** (`t2va`, `fl2va`, `ref2va`) and the partition probe that reads `_minimax_h3` from `model_index.json` are MiniMax-H3 specific: a different video model on the same server needs those two touched, but nothing about the transport or the job handling changes. There is no dependency on DGX Spark or any particular GPU.
 
 Image generation is **not** implemented. vLLM-Omni does expose `/v1/images/generations` and `/v1/images/edits`, so adding it is a matter of a task mode and a shorter result pane rather than new plumbing. Whether it produces anything depends on the model actually loaded.
 
@@ -435,11 +576,11 @@ vLLM-Omni bounds the wait for a finished step's background copy with `_ASYNC_OUT
 
 **The timeout half is fixed upstream.** [#6255](https://github.com/vllm-project/vllm-omni/pull/6255) merged on 2026-08-22: the bound is now `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT`, defaulting to 600 s. Any nightly from that date on already has it, and the build-time workaround in [joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4) is no longer needed. Check what your image actually reads before setting anything: a workaround's environment variable keeps being accepted long after nothing looks at it.
 
-**The health-check half is not fixed.** A dead pump still reports as a healthy server, because `check_health()` does not look at the pump thread. [#6253](https://github.com/vllm-project/vllm-omni/pull/6253) adds that check along with per-request fault containment, and is still open as of 2026-10-15. Until it lands, a process-level probe against vLLM-Omni cannot tell a wedged engine from a slow one, and neither can this frontend.
+**The health-check half is not fixed.** A dead pump still reports as a healthy server, because `check_health()` does not look at the pump thread. [#6253](https://github.com/vllm-project/vllm-omni/pull/6253) adds that check along with per-request fault containment, and is still open as of 2026-10-20. Until it lands, a process-level probe against vLLM-Omni cannot tell a wedged engine from a slow one, and neither can this frontend.
 
-**The sync route has its own deadline.** `POST /v1/videos/sync` gives up with a `504` after `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` seconds, 600 by default. That is shorter than many long renders here (the 50 step row in the table above took 1034 s), so raise it on the server for long jobs; h3-ui itself waits up to two hours. The MiniMax-H3-DGX-Spark deployment already sets it to 7200 through `H3_VIDEO_SYNC_TIMEOUT`.
+**The sync route has its own deadline.** `POST /v1/videos/sync` gives up with a `504` after `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` seconds, 600 by default. That is shorter than many long renders here (the 50 step row in the table above took 1034 s), so raise it on the server for long jobs if you run with `H3_ASYNC_JOBS=0`; h3-ui itself waits up to two hours there. The MiniMax-H3-DGX-Spark deployment already sets it to 7200 through `H3_VIDEO_SYNC_TIMEOUT`. The job API has no such deadline: h3-ui polls until the job ends, and gives up only if the server stays unreachable for five minutes.
 
-**Encoding still blocks the server.** The MP4 is muxed synchronously on vLLM-Omni's event loop, so for as long as it takes (11.7 s for 1344x768 at 4 s on a GB10) the server answers nothing, `/v1/models` included. h3-ui probes off the request path and only calls a box offline after three missed probes, so this shows as a stale reading rather than an outage. [#7095](https://github.com/vllm-project/vllm-omni/pull/7095) moves the encode off the loop and is still open.
+**Encoding still runs on the server's event loop.** Without pre-encoding, the MP4 is muxed synchronously on vLLM-Omni's event loop, and for as long as that takes the server answers nothing, `/v1/models` included. On the 2026-08-02 image that was 11.7 s for 1344x768 at 4 s on a GB10; on v0.30.0 the same clip stalls it for 0.67 s. h3-ui probes off the request path and only calls a box offline after three missed probes, so either shows as a stale reading rather than an outage. [#7095](https://github.com/vllm-project/vllm-omni/pull/7095) moves the encode off the loop and is still open. Until it lands, `preencode_mp4` sidesteps it (0.03 s on the same clip): the worker hands over finished bytes and the loop has nothing to mux. h3-ui asks for it on every request to a current server.
 
 The original report, [#5821](https://github.com/vllm-project/vllm-omni/issues/5821), was closed as a duplicate of [#5793](https://github.com/vllm-project/vllm-omni/issues/5793), which was filed 13 hours earlier with the same root cause. That call was correct.
 

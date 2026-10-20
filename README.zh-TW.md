@@ -14,7 +14,8 @@
 
 - **文字、首格圖片、參考條件三種條件模式**：任務清單直接讀自載入中的 checkpoint，所以 UI 會對齊實際載入的 partition，不會給出伺服器根本會拒絕的選項。
 - **送出前就擋掉不合法的附件組合**：每個任務都標明自己接受什麼，表單會直接拒絕不相符的組合，而不是讓伺服器拒收。
-- **真正的佇列**：想送幾個就送幾個，不必等。每個設定的上游各有一個 worker，依送出順序逐一處理，所以你可以排好一批就走開。排隊中的工作可以取消；正在跑的不行，因為上游呼叫是同步的，而且已經在 GPU 上了。
+- **真正的佇列**：想送幾個就送幾個，不必等。每個設定的上游各有一個 worker，依送出順序逐一處理，所以你可以排好一批就走開。排隊中的工作可以取消；在新版 vLLM-Omni 上，正在跑的也可以，會在下一個去噪步數停下。
+- **H3 其餘的功能**：最長 300 秒的長片、以音軌驅動影片、對既有片段做 latent 遮罩編輯、timeline guides 與 latent 放大，伺服器會拒絕的組合都先在這裡擋下。見[請求功能](#請求功能)。
 - **工作不隨頁面消失**：生成是在伺服器端對著一個 job id 進行，所以關掉分頁或斷線都不會殺掉一個十分鐘的算圖。你回來時完成的影片就在那裡。
 - **預設可重現**：每個結果都會在影片旁寫一份 JSON，記錄你選的參數與實際送給伺服器的欄位。
 - **隨機種子**：🎲 隨手抽一個；勾選核取方塊則每次生成都抽新的。無論哪種方式，抽到的值都會寫回 seed 欄位並在完成時顯示，所以幸運的結果不會因為記不住數字而消失。
@@ -135,12 +136,99 @@ h3-ui 用同樣的方式讀同一個檔名：
 | `ref2v` | 提供 `ref2va`，伺服器要以 `--task-type ref2va` 啟動 |
 
 所以 `minimax_h3_fl2v_turbo_4step_v1.2_768p_bf16.safetensors` 在新版上是 4 步、shift
-6/3，`minimax_h3_ref2v_turbo_8step_v1.0_bf16.safetensors` 則是 8 步、shift 12/3、只有
-ref2va。明確設定的 `H3_REQUEST_LORA_*` 仍然優先於檔名。ComfyUI 與 fp8 匯出檔不符合上游
+6/3，`minimax_h3_ref2v_turbo_4step_v0.1_bf16.safetensors` 則是 4 步、shift 12/3、只有
+ref2va。明確設定的 `H3_REQUEST_LORA_*` 仍然優先於檔名。
+
+有一個檔案不守這個規則。`minimax_h3_ref2v_turbo_8step_v1.0_768p_bf16.safetensors`
+發行時寫的是 shift 12/3（[發行說明](https://huggingface.co/lightx2v/Minimax-h3-Turbo/discussions/51)），
+但檔名帶 768p，所以 vLLM-Omni 讀成 6/3，其他值一律拒收。h3-ui 送伺服器接受的值。
+[#7591](https://github.com/vllm-project/vllm-omni/pull/7591) 會修正伺服器端，截至 2026-10-20
+仍是 open；合併之後，這個檔案請設 `H3_REQUEST_LORA_FLOW_SHIFT=12`。ComfyUI 與 fp8 匯出檔不符合上游
 的檔名格式，不會被載入；預先融合或疊多個 adapter 也不支援。
 
 兩者互斥：融合過的伺服器會拒收同時指名 LoRA 的請求，所以 h3-ui 會直接擋下並說明是哪個
 adapter 擋路，而不是讓上游拒絕。
+
+## 請求功能
+
+這一節的功能都需要 `H3_SERVER_CONTRACT=current`，也就是 vLLM-Omni v0.30.0 以後。
+表單只顯示設定的伺服器跑得動的功能；伺服器會拒絕的組合，`POST /api/generate`
+會在佔用 GPU 之前先回 400，並指出是哪兩項衝突。
+
+**MP4 改在 worker 上編碼。** 每個請求都會帶 `preencode_mp4`
+（[#7018](https://github.com/vllm-project/vllm-omni/pull/7018)）：worker 在後面的
+VAE 區塊還在解碼時，就先把前面的區塊編碼，API 行程收到的是編好的 bytes，event loop
+上就沒有東西要封裝。v0.30.0 的封裝已經不是 8 月那種 11.7 秒的停擺（見[下文](#關於長時間生成)）：
+GB10 上一支 1344x768、4 秒的 Turbo 片子，不開時 `/v1/models` 最長停 0.67 秒，開了是 0.03 秒。
+總耗時差不多（266 秒對 271 秒），兩支 MP4 的位元組完全相同。真正的好處在長片：整支解碼後的
+影片不必放在 API 行程裡。設 `H3_PREENCODE_MP4=0` 可關閉。
+
+**工作改走 job API，所以正在跑的也能取消。** 在新版 vLLM-Omni 上，h3-ui 以
+`POST /v1/videos` 建立工作、輪詢、取回檔案，再把它從伺服器刪掉，不再掛著一條同步請求。
+取消正在跑的工作會送 `DELETE`，MiniMax-H3 會在下一個去噪步數邊界停下
+（[#7844](https://github.com/vllm-project/vllm-omni/pull/7844)）。伺服器確認之前，工作會顯示
+「取消中」。伺服器會立刻回應 `DELETE`，GPU 則在下一個邊界停下：GB10 上實測 2 秒確認取消，
+worker 日誌在 10 秒後記下停止；在 latent 精修階段則花了 40 秒。這段期間那台機器的下一件工作可能已經送出，它會在伺服器端
+排隊等前一件放手；伺服器一次只跑一個請求，所以不會同時佔用 GPU。伺服器端的耗時與峰值記憶體改從工作紀錄讀取，
+不再讀回應標頭。代價是工作存在伺服器上：h3-ui 若在算圖途中重啟，伺服器會跑完一支沒人來拿的片子。
+另外它需要單一 API server 行程，這是預設值。設 `H3_ASYNC_JOBS=0` 會改回 `/v1/videos/sync`。
+
+**長片**（[#7838](https://github.com/vllm-project/vllm-omni/pull/7838)）。超過 15 秒的請求
+必須明確開啟。Ref2VA 預設用續寫，最長 300 秒：以 277 格為一個視窗、重疊 22 格分段取樣，
+每段以前一段的尾巴為條件，所以去噪的記憶體只跟視窗大小有關。其他模式一次生成整支，
+最長 30 秒。視窗與重疊可以自訂（17n+5 格，視窗介於 107 到 345），續寫也可以每個視窗各給
+一段 prompt，表單會顯示這支片有幾個視窗。續寫只能在不快取的路徑上跑，所以會帶
+`quality=lossless`。這些上限是伺服器的合理性檢查，不保證這個畫布放得進記憶體。
+
+**以音軌驅動影片。** Ref2VA 附上參考音訊時，`audio_mode=lock_source` 會把這段音訊放進
+目標裡，並在整個取樣過程保持乾淨，讓畫面跟著它走，而不是把它當成短短的參考。回傳的
+音軌是 VAE 重建出來的版本。
+
+在新版伺服器上，參考圖片與音訊會以兩個檔案放在 `input_references` 上傳，H3 依類型分開處理。
+舊版 h3-ui 把音訊以 data URL 放在 `audio_reference` 欄位裡，而伺服器拒收超過 1 MiB 的一般
+表單欄位，所以幾秒以上的音軌只會得到連線被重置。舊 contract 仍然使用這個欄位。
+
+**Latent 遮罩編輯**（[#7465](https://github.com/vllm-project/vllm-omni/pull/7465)）。上傳來源
+片段，也可以另外附來源音訊，再指定畫面與聲音各要重新生成多少：0 保留來源，1 完全取代，
+也可以只套用在兩個時間點之間。v0.30.0 的伺服器只接受純量或 latent token 格點形式的影像遮罩，
+所以時間範圍由 h3-ui 自己換算到格點上：每個 latent 取它涵蓋的影格中最大的值（因果 VAE
+把第 0 格單獨成一個 latent，之後每四格一個），所以範圍碰到的影格都會重新生成。換算需要
+明確的畫布，因此編輯不接受「依圖片比例」。預設是重生畫面、保留聲音。
+
+**Timeline guides**（[#8460](https://github.com/vllm-project/vllm-omni/pull/8460)、
+[#8838](https://github.com/vllm-project/vllm-omni/pull/8838)）。把圖片、短片或音訊釘在輸出的
+某個時間點，最多 8 個；負數表示從結尾倒數。它需要原始權重與原生路徑，所以 h3-ui 會帶
+`quality=lossless`，並拒絕與 Turbo、融合或蒸餾的排程、續寫、編輯、放大及鎖定音軌同時使用。
+這項功能從 2026-10-13 起在 main 上，v0.32.0rc1 也有；舊版伺服器會默默丟掉這些欄位，
+所以要明確開啟：`H3_TIMELINE_GUIDES=1`。
+
+**Latent 放大與精修**（[#8322](https://github.com/vllm-project/vllm-omni/pull/8322)，
+v0.31.0rc1）。社群的 upscaler 在 VAE 之前放大完成的 latent，所以片子只在大尺寸解碼一次；
+精修則在新尺寸上重跑一部分步數，把真正的細節補回來（上游測得 0.35 最好，再高就是重新生成，
+不是銳化）。upscaler 是另一個 691 MB 的 checkpoint，伺服器必須帶著它啟動
+（`--additional-config '{"latent_upscaler_path": ...}'`）。上游 recipe 寫的檔名在 repo 裡
+並不存在，要下載的是 [LBH-123-AI/Minimax_h3_latent_Upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler)
+的 `minimax_h3_latent_upscaler_3d_conv_v1/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors`。
+只做精修不需要 checkpoint。
+以 `H3_LATENT_UPSCALE=1` 開啟。精修不能與續寫或編輯同時使用；兩者的時間估算都是同一個
+成本模型套在較大的畫布上，不是實測擬合。
+
+### GB10 實測
+
+在一台 DGX Spark（GB10）上，以 online FP8、seed 1101 各跑一次，全程掛溫度守衛。沒掛守衛時，
+連續一小時這樣的測試讓機器斷電過一次，所以在這種硬體上，長時間的算圖之間要留冷卻時間。
+
+| 功能 | 伺服器 | 設定 | 耗時 | 結果 |
+| --- | --- | --- | ---: | --- |
+| 預先編碼 MP4 | v0.30.0 | 1344x768、4 秒、Turbo | 271 秒（不開 266 秒） | `/v1/models` 最長停 0.03 秒（不開 0.67 秒） |
+| 取消執行中的工作 | v0.30.0 | 768x448、4 秒、20 步 | 2 秒內確認 | GPU 在 10 秒後停下；下一件 80 秒完成 |
+| 編輯：畫面 0.5、保留聲音 | v0.30.0 | 768x448、4 秒、Turbo | 106 秒 | 全片與來源的 PSNR 35.5 dB |
+| 編輯：重生 2 到 3 秒 | v0.30.0 | 768x448、4 秒、Turbo | 106 秒 | 範圍外 37 dB、範圍內 28 dB；聲音保留 |
+| 長片整段 | v0.30.0 | t2va 768x448、20 秒、Turbo | 538 秒 | 481 格，峰值 78 GB |
+| Timeline guides | nightly 2026-10-19 | 768x448、5 秒、20 步；2 秒處放圖片、最後一秒放短片 | 381 秒 | 被釘住的那一格與圖片 33 dB，其他格 24 到 25 dB；短片的效果量不出來 |
+| Latent 放大 2 倍 | nightly 2026-10-19 | 768x448 到 1536x896、4 秒、Turbo | 164 秒 | |
+| 放大 1.5 倍、精修 0.35 | nightly 2026-10-19 | 768x448 到 1152x672、4 秒、8 步 | 238 秒 | 同設定 20 步時，8 分鐘後被溫度守衛中止 |
+| 續寫、鎖定音軌 | nightly 2026-10-19、Ref2VA | 768x448、8 秒、8 步、視窗 107 重疊 22、兩段 prompt | 262 秒 | 192 格、分兩個視窗；音軌與驅動音訊的相關係數 0.94 |
 
 ### 重新校準時間估算
 
@@ -217,6 +305,11 @@ python3 server.py
 | `H3_REQUEST_LORA_TASKS` | *(依檔名)* | adapter 提供的任務：`fl2v` 是 `t2va,fl2va`，`ref2v` 是 `ref2va` |
 | `H3_LORA_PATH` | *(空)* | 伺服器啟動時用的 adapter。有值即視為 FastH3 已融合 |
 | `H3_FASTH3` | *(未設定)* | 覆寫：布林開關（vLLM-Omni 為 4，FastVideo 為 5），或要釘死的步數，例如 V2 在 vLLM-Omni 上是 `8`。`0` 是強制關閉 |
+| `H3_PREENCODE_MP4` | `1` | 請伺服器在 worker 上編碼 MP4，只限 current contract |
+| `H3_PREENCODE_BATCH_FRAMES` | *（伺服器預設）* | 預先編碼時，每次 worker 傳輸的格數 |
+| `H3_ASYNC_JOBS` | `1` | vLLM-Omni 的工作走 `/v1/videos`，正在跑的也能取消；`0` 改用 `/v1/videos/sync` |
+| `H3_TIMELINE_GUIDES` | `0` | 提供 timeline guides，需要 v0.32.0rc1 或 2026-10-13 以後的 nightly |
+| `H3_LATENT_UPSCALE` | `0` | 提供 latent 放大與精修，需要 v0.31.0rc1，放大還需要 upscaler checkpoint |
 | `H3_EST_FIXED_SECONDS` | `0` | 時間估算的常數項 |
 | `H3_EST_PER_MPXS` | `11.88` | 每「百萬畫素 × 秒」的成本，與步數無關 |
 | `H3_EST_PER_MPXS_STEP` | `6.05` | 每步中對 token 數線性的部分 |
@@ -271,7 +364,7 @@ ssh -L 8080:127.0.0.1:8080 user@gpu-box
 
 ## 使用說明
 
-**佇列。** 送出後會加入佇列並回報排隊位置；表單維持可用，所以你可以一次排好幾種變化。佇列面板會顯示等待中的項目、正在跑的項目（已耗時對照預估時間），並且可以取消任何還沒開始的工作。
+**佇列。** 送出後會加入佇列並回報排隊位置；表單維持可用，所以你可以一次排好幾種變化。佇列面板會顯示等待中的項目、正在跑的項目（已耗時對照預估時間），並且可以取消任何還沒開始的工作；在走 job API 的機器上，正在跑的也能取消。
 
 **重現一個結果。** 每個 `media/*.mp4` 旁邊都有一份 `.mp4.json`：
 
@@ -312,7 +405,7 @@ ssh -L 8080:127.0.0.1:8080 user@gpu-box
 | `POST` | `/api/generate` | 排入一個工作；回傳 `{id, position}` |
 | `GET` | `/api/jobs` | 整個佇列，加上最近完成的工作 |
 | `GET` | `/api/job/<id>` | 單一工作的狀態 |
-| `POST` | `/api/job/<id>/cancel` | 取消排隊中的工作（已開始則回 409） |
+| `POST` | `/api/job/<id>/cancel` | 取消排隊中的工作，或 job API 機器上正在跑的工作（會先變成 `cancelling`）；其他情況回 409 |
 | `DELETE` | `/api/job/<id>` | 從佇列清單移除一個已結束的工作，影片保留 |
 | `DELETE` | `/api/jobs/finished` | 從佇列清單移除所有已結束的工作 |
 | `GET` | `/api/history` | 已完成的結果與它們的參數 |
@@ -364,12 +457,29 @@ curl -X POST localhost:8080/api/generate -H 'Content-Type: application/json' -d 
 
 附件是 data URL：`{"image": "data:image/png;base64,..."}`，參考影片條件則用 `{"videos": [...]}`。
 
+請求功能使用下列欄位，伺服器會拒絕的地方都會回 400：
+
+```json
+{
+  "long_video": {"mode": "continuation", "window": 277, "overlap": 22,
+                 "prompts": ["first window", "second window"]},
+  "lock_audio": true,
+  "edit": {"video": 1.0, "audio": 0.0, "start": 2.0, "end": 3.5},
+  "guides": [{"at": 1.5, "visual": 0, "audio": 1}, {"at": -1.0, "visual": 2}],
+  "latent_upscale": 2.0,
+  "latent_refine": 0.35
+}
+```
+
+編輯的來源片段放在 `attachments` 的 `source_video` 與 `source_audio`。guide 以位置指向
+`attachments.guide_files` 裡的檔案，那裡的每個檔案都必須被用到。
+
 對著 FastH3 伺服器時，`steps` 必須是釘死的步數（`/api/status` 的 `pinned_steps`），兩個 shift 欄位都要省略；不符合就會拿到一個
 說明違反哪條規則的 400，而不是被默默改寫成一次 sidecar 會記錯的算圖。
 
 ## 範圍
 
-伺服器端的契約是 vLLM-Omni 與 FastVideo 提供的 `POST /v1/videos/sync`。**任務詞彙**（`t2va`、`fl2va`、`ref2va`）以及從 `model_index.json` 讀 `_minimax_h3` 的 partition 探測是 MiniMax-H3 專屬的：同一台伺服器換一個影片模型，要動的是這兩處，傳輸與工作處理則完全不用改。它不依賴 DGX Spark 或任何特定 GPU。
+伺服器端的契約是 vLLM-Omni 與 FastVideo 提供的 `POST /v1/videos/sync`，或 vLLM-Omni 的 job API（`POST /v1/videos`，再對該工作 `GET` 與 `DELETE`）。**任務詞彙**（`t2va`、`fl2va`、`ref2va`）以及從 `model_index.json` 讀 `_minimax_h3` 的 partition 探測是 MiniMax-H3 專屬的：同一台伺服器換一個影片模型，要動的是這兩處，傳輸與工作處理則完全不用改。它不依賴 DGX Spark 或任何特定 GPU。
 
 圖片生成**未**實作。vLLM-Omni 確實有 `/v1/images/generations` 與 `/v1/images/edits`，所以要加的話是多一個任務模式與一塊比較短的結果面板，而不是新的管線；至於能不能生出東西，取決於實際載入的模型。
 
@@ -390,11 +500,11 @@ vLLM-Omni 用 `_ASYNC_OUTPUT_TIMEOUT` 限制等待某一步背景複製完成的
 
 **逾時這一半上游已經修好。** [#6255](https://github.com/vllm-project/vllm-omni/pull/6255) 在 2026-08-22 合併，上限改成讀 `VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT`，預設 600 秒。那天之後的 nightly 都已經帶著，[joeynyc/MiniMax-H3-DGX-Spark#4](https://github.com/joeynyc/MiniMax-H3-DGX-Spark/pull/4) 的 build 階段繞路不再需要。設任何東西之前先確認你的 image 實際讀哪個變數：繞路用的環境變數在沒有人讀它之後，還是會被乖乖收下。
 
-**健康檢查那一半還沒修。** pump 死掉的伺服器至今仍會回報健康，因為 `check_health()` 不看 pump 執行緒。[#6253](https://github.com/vllm-project/vllm-omni/pull/6253) 補上這個檢查與逐請求的故障隔離，截至 2026-10-15 仍是 open。在它進去之前，行程層級的探測分不出卡死的引擎與只是很慢的引擎，這個前端也分不出。
+**健康檢查那一半還沒修。** pump 死掉的伺服器至今仍會回報健康，因為 `check_health()` 不看 pump 執行緒。[#6253](https://github.com/vllm-project/vllm-omni/pull/6253) 補上這個檢查與逐請求的故障隔離，截至 2026-10-20 仍是 open。在它進去之前，行程層級的探測分不出卡死的引擎與只是很慢的引擎，這個前端也分不出。
 
-**同步端點有自己的期限。** `POST /v1/videos/sync` 超過 `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` 秒（預設 600）就回 `504` 放棄。這比這裡不少長片的算圖時間還短（上表 50 步那列花了 1034 秒），所以長工作要在伺服器端調高；h3-ui 自己最多等兩小時。MiniMax-H3-DGX-Spark 部署已經透過 `H3_VIDEO_SYNC_TIMEOUT` 設成 7200。
+**同步端點有自己的期限。** `POST /v1/videos/sync` 超過 `VLLM_OMNI_VIDEO_SYNC_TIMEOUT` 秒（預設 600）就回 `504` 放棄。這比這裡不少長片的算圖時間還短（上表 50 步那列花了 1034 秒），所以設了 `H3_ASYNC_JOBS=0` 時，長工作要在伺服器端調高；這時 h3-ui 自己最多等兩小時。MiniMax-H3-DGX-Spark 部署已經透過 `H3_VIDEO_SYNC_TIMEOUT` 設成 7200。job API 沒有這個期限：h3-ui 會一直輪詢到工作結束，只有伺服器連續五分鐘連不上才放棄。
 
-**編碼仍會卡住伺服器。** MP4 是在 vLLM-Omni 的 event loop 上同步封裝的，封裝期間（GB10 上 1344x768、4 秒要 11.7 秒）伺服器什麼都不回，`/v1/models` 也一樣。h3-ui 在請求路徑之外探測，連續三次沒回應才判定離線，所以這段時間只會顯示讀數稍舊，不會顯示斷線。[#7095](https://github.com/vllm-project/vllm-omni/pull/7095) 把編碼移出 event loop，目前仍是 open。
+**編碼仍在伺服器的 event loop 上。** 不預先編碼時，MP4 是在 vLLM-Omni 的 event loop 上同步封裝的，封裝期間伺服器什麼都不回，`/v1/models` 也一樣。2026-08-02 的映像在 GB10 上封裝 1344x768、4 秒要 11.7 秒；v0.30.0 同一支片子只停 0.67 秒。h3-ui 在請求路徑之外探測，連續三次沒回應才判定離線，所以兩者都只會顯示讀數稍舊，不會顯示斷線。[#7095](https://github.com/vllm-project/vllm-omni/pull/7095) 把編碼移出 event loop，目前仍是 open。在它合併之前，`preencode_mp4` 可以繞過這個問題（同一支片子 0.03 秒）：worker 交出的是編好的 bytes，event loop 沒有東西要封裝。h3-ui 對 current 伺服器的每個請求都會帶這個欄位。
 
 最早的回報 [#5821](https://github.com/vllm-project/vllm-omni/issues/5821) 被判為 [#5793](https://github.com/vllm-project/vllm-omni/issues/5793) 的重複而關閉，後者早 13 小時提出且根因相同。那個判定是對的。
 
