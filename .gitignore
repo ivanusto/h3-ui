@@ -9,3 +9,6 @@ ui.log
 *.log
 __pycache__/
 *.py[cod]
+
+# Claude Code per-user permissions (may contain secrets)
+.claude/settings.local.json
